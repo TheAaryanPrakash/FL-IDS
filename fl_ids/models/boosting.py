@@ -22,6 +22,21 @@ would mean the autoencoder trains on effectively unfiltered garbage.
 **Distribution mechanism:** the model is broadcast to clients (not
 aggregated via Flower's weight-averaging), so it must be serializable to
 bytes and reconstructable client-side — see `to_bytes`/`from_bytes`.
+
+**Design decision — feature scale:** component 1 normalizes features
+per-client (never globally — see `fl_ids.data.pipeline`), so there is no
+single shared scaler this server-side model could use that would also
+match every client's local scale. Instead, this model is trained on its
+own server-held calibration set *standardized the same way* (a scaler
+fit on the calibration set itself) — every client independently
+standardizes its own local data to roughly the same per-feature shape
+(mean 0, std 1), so the model's learned split thresholds stay meaningful
+in that shared "standardized units" space even though no two clients (or
+the server) use the literal same scaler. This is not a rigorous
+cross-client alignment (each client's raw-to-standardized mapping still
+differs), but tree splits only need per-feature values to be in a
+comparable range, not identically scaled — a documented, deliberate
+approximation, not a silent gap.
 """
 
 from __future__ import annotations

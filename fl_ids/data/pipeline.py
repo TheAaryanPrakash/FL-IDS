@@ -212,45 +212,34 @@ def _split_client_data(
     return train_idx, val_benign_idx, test_idx
 
 
-def build_federated_dataset(
-    csv_path: str | Path,
+def partition_and_normalize_clients(
+    X: np.ndarray,
+    y: np.ndarray,
+    benign_class: int,
     config: DataConfig,
     seed: int,
-) -> tuple[dict[int, dict[str, np.ndarray]], LabelEncoder, list[str]]:
-    """Build the full per-client federated dataset (component 1's main entrypoint).
+) -> dict[int, dict[str, np.ndarray]]:
+    """Partition (X, y) non-IID across clients, then per-client split and normalize.
+
+    Shared by `build_federated_dataset` (real Edge-IIoTset CSV) and the
+    synthetic federated dataset builder used for Phase 3's FL-loop tests
+    (`fl_ids.data.synthetic.make_synthetic_federated_dataset`) — both need
+    the identical Dirichlet-partition -> per-client held-out-slice ->
+    per-client-normalize pipeline, just starting from different sources of
+    (X, y).
 
     Args:
-        csv_path: Path to `DNN-EdgeIIoT-dataset.csv`.
+        X: Full feature matrix, shape (n_samples, n_features).
+        y: Integer-encoded class labels, shape (n_samples,).
+        benign_class: Integer class index corresponding to the benign class.
         config: Data configuration (num_clients, dirichlet_alpha, split
             fractions, normalize_per_client).
         seed: Global random seed, for reproducible partitioning/splitting.
 
     Returns:
-        A tuple of:
-        - `{client_id: {"X", "y", "X_val_benign", "y_val_benign", "X_test",
-          "y_test"}}`, all values `np.ndarray`.
-        - The fitted `LabelEncoder` mapping `Attack_type` strings to the
-          integer classes used in `y`.
-        - The list of feature column names, in `X` column order.
-
-    Raises:
-        AssertionError: If NaNs remain in the feature matrix after cleaning
-            (would indicate a bug in `clean_dataframe`).
+        `{client_id: {"X", "y", "X_val_benign", "y_val_benign", "X_test",
+        "y_test"}}`, all values `np.ndarray`.
     """
-    df = load_raw_csv(csv_path)
-    df = clean_dataframe(df)
-    df = one_hot_encode_categoricals(df)
-
-    label_encoder = LabelEncoder()
-    y = label_encoder.fit_transform(df[TARGET_COLUMN].values)
-    benign_class = int(label_encoder.transform([BENIGN_LABEL])[0])
-
-    feature_df = df.drop(columns=[TARGET_COLUMN])
-    feature_names = feature_df.columns.tolist()
-    X = feature_df.to_numpy(dtype=np.float32)
-
-    assert not np.isnan(X).any(), "NaNs present in feature matrix after cleaning"
-
     client_index_map = dirichlet_partition(y, config.num_clients, config.dirichlet_alpha, seed)
 
     client_data: dict[int, dict[str, np.ndarray]] = {}
@@ -290,4 +279,47 @@ def build_federated_dataset(
             "y_test": y[test_idx],
         }
 
+    return client_data
+
+
+def build_federated_dataset(
+    csv_path: str | Path,
+    config: DataConfig,
+    seed: int,
+) -> tuple[dict[int, dict[str, np.ndarray]], LabelEncoder, list[str]]:
+    """Build the full per-client federated dataset (component 1's main entrypoint).
+
+    Args:
+        csv_path: Path to `DNN-EdgeIIoT-dataset.csv`.
+        config: Data configuration (num_clients, dirichlet_alpha, split
+            fractions, normalize_per_client).
+        seed: Global random seed, for reproducible partitioning/splitting.
+
+    Returns:
+        A tuple of:
+        - `{client_id: {"X", "y", "X_val_benign", "y_val_benign", "X_test",
+          "y_test"}}`, all values `np.ndarray`.
+        - The fitted `LabelEncoder` mapping `Attack_type` strings to the
+          integer classes used in `y`.
+        - The list of feature column names, in `X` column order.
+
+    Raises:
+        AssertionError: If NaNs remain in the feature matrix after cleaning
+            (would indicate a bug in `clean_dataframe`).
+    """
+    df = load_raw_csv(csv_path)
+    df = clean_dataframe(df)
+    df = one_hot_encode_categoricals(df)
+
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(df[TARGET_COLUMN].values)
+    benign_class = int(label_encoder.transform([BENIGN_LABEL])[0])
+
+    feature_df = df.drop(columns=[TARGET_COLUMN])
+    feature_names = feature_df.columns.tolist()
+    X = feature_df.to_numpy(dtype=np.float32)
+
+    assert not np.isnan(X).any(), "NaNs present in feature matrix after cleaning"
+
+    client_data = partition_and_normalize_clients(X, y, benign_class, config, seed)
     return client_data, label_encoder, feature_names
