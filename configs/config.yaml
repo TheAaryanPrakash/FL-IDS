@@ -1,0 +1,71 @@
+# FL-IDS configuration.
+# All tunable parameters live here — none should be hard-coded as magic
+# numbers elsewhere in fl_ids/. Values below are the defaults called out
+# in the project spec (CLAUDE.md); sweeps (e.g. dirichlet_alpha,
+# poisoning fractions) override these per-run rather than editing this file.
+
+seed: 42
+
+data:
+  dnn_csv_path: "data/raw/DNN-EdgeIIoT-dataset.csv"
+  pcap_dir: "data/raw/pcaps"
+  num_clients: 10
+  dirichlet_alpha: 0.3
+  val_benign_fraction: 0.15
+  test_fraction: 0.15
+  normalize_per_client: true
+
+boosting:
+  # LightGBM first-pass classifier.
+  label_source: "server_held_calibration_set"  # or "client_local_labels"
+  calibration_fraction: 0.05  # fraction of data held server-side for cold-start bootstrap
+  confidence_threshold: 0.7  # cascade decision rule: below this, fall through to autoencoder
+  num_boost_round: 200
+  learning_rate: 0.05
+  num_leaves: 31
+  broadcast_every_n_rounds: 1
+  update_every_n_rounds: 3  # incremental update cadence using aggregated histograms
+
+autoencoder:
+  bottleneck_dim: 8
+  hidden_dims: [32, 16]
+  learning_rate: 0.001
+  local_epochs: 5
+  batch_size: 64
+  anomaly_percentile: 97  # recalibrated every round on client benign validation slice
+  reconstruction_error_bins: 50
+  reconstruction_error_range: [0.0, 10.0]
+
+cascade:
+  # Shared decision rule used consistently across evaluation, dashboard, and SDN bridge.
+  confidence_threshold: 0.7  # mirrors boosting.confidence_threshold; single source of truth
+  anomaly_confidence_clip: [0.0, 1.0]
+
+fl:
+  num_rounds: 20
+  clients_per_round: 10
+  local_epochs: 5
+  strategy: "custom_trust_filtered"  # or "fedavg" for Phase 3 baseline
+
+robustness:
+  trim_fraction: 0.15  # trimmed-mean aggregation
+  norm_clip_multiplier: 2.0  # reject/clip updates beyond this multiple of median norm
+  mad_outlier_threshold: 3.0  # median absolute deviation multiplier for cosine outlier flag
+  trust_ema_alpha: 0.3  # weight on new round's score vs. running trust history
+
+sdn:
+  block_confidence_threshold: 0.85
+  rate_limit_confidence_threshold: 0.5
+  controller_host: "127.0.0.1"
+  controller_port: 6653
+  bridge_api_host: "127.0.0.1"
+  bridge_api_port: 8080
+
+evaluation:
+  poisoning_fractions: [0.0, 0.2, 0.3, 0.4, 0.5]
+  output_dir: "results"
+
+logging:
+  level: "INFO"
+  log_dir: "logs"
+  log_file: "fl_ids.log"
