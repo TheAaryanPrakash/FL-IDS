@@ -23,6 +23,20 @@ would mean the autoencoder trains on effectively unfiltered garbage.
 aggregated via Flower's weight-averaging), so it must be serializable to
 bytes and reconstructable client-side — see `to_bytes`/`from_bytes`.
 
+**Single source of truth for the cascade confidence threshold:**
+`confidence_threshold` is a constructor argument here, always sourced
+from `CascadeConfig.confidence_threshold` — never from a second,
+same-shaped field on `BoostingConfig`. CLAUDE.md's "Cascade decision
+rule" is explicit that this threshold needs one precise, shared
+definition; an earlier version of this module read it from
+`BoostingConfig.confidence_threshold` instead, with `CascadeConfig`
+carrying a same-valued field that was never actually consulted by code —
+two fields meant to mirror each other with nothing enforcing they
+actually did, exactly the ad-hoc-per-component risk CLAUDE.md warns
+about. Fixed in Phase 6, before the evaluation harness (component 12)
+and cascade module (`fl_ids.models.cascade`) started depending on this
+threshold being genuinely singular.
+
 **Design decision — feature scale: this model always trains and predicts
 on RAW (unnormalized) features, never per-client-normalized ones.**
 Component 1 normalizes per-client (never globally — see
@@ -94,19 +108,26 @@ class BoostingClassifier:
         num_classes: int,
         benign_class: int,
         seed: int,
+        confidence_threshold: float,
     ) -> None:
         """Initialize an untrained classifier.
 
         Args:
-            config: Boosting hyperparameters and cascade confidence threshold.
+            config: Boosting hyperparameters (num_boost_round, learning_rate,
+                num_leaves).
             num_classes: Number of attack-type classes (including benign).
             benign_class: The integer class index corresponding to "Normal".
             seed: Random seed for training reproducibility.
+            confidence_threshold: The cascade decision rule's shared
+                confidence threshold — always `CascadeConfig.confidence_threshold`,
+                never a separate boosting-only copy (see this module's
+                docstring).
         """
         self.config = config
         self.num_classes = num_classes
         self.benign_class = benign_class
         self.seed = seed
+        self.confidence_threshold = confidence_threshold
         self._booster: lgb.Booster | None = None
 
     @property
@@ -179,7 +200,7 @@ class BoostingClassifier:
         predicted_class = np.argmax(proba, axis=1)
         confidence = proba[np.arange(len(proba)), predicted_class]
         is_confident_attack = (predicted_class != self.benign_class) & (
-            confidence >= self.config.confidence_threshold
+            confidence >= self.confidence_threshold
         )
         return CascadeStage1Result(predicted_class, confidence, is_confident_attack)
 
@@ -218,21 +239,25 @@ class BoostingClassifier:
         num_classes: int,
         benign_class: int,
         seed: int,
+        confidence_threshold: float,
     ) -> "BoostingClassifier":
         """Reconstruct a classifier client-side from a broadcast model payload.
 
         Args:
             data: Bytes produced by `to_bytes` on the server.
-            config: Same boosting config as the server (cascade threshold
-                must match for consistent client-side filtering).
+            config: Same boosting hyperparameters as the server (unused for
+                inference, kept for interface symmetry).
             num_classes: Number of attack-type classes.
             benign_class: Integer class index corresponding to "Normal".
             seed: Seed to store on the reconstructed instance (unused for
                 inference, kept for interface symmetry).
+            confidence_threshold: Must match the server's
+                `CascadeConfig.confidence_threshold` for consistent
+                client-side filtering.
 
         Returns:
             A `BoostingClassifier` ready for `predict_proba`/`predict_cascade_stage1`.
         """
-        instance = cls(config, num_classes, benign_class, seed)
+        instance = cls(config, num_classes, benign_class, seed, confidence_threshold)
         instance._booster = lgb.Booster(model_str=data.decode("utf-8"))
         return instance

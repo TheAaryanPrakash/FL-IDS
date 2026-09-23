@@ -17,9 +17,10 @@ data:
 
 boosting:
   # LightGBM first-pass classifier.
+  # Cascade confidence threshold lives only under cascade.confidence_threshold
+  # below -- not duplicated here (see fl_ids.models.boosting's module docstring).
   label_source: "server_held_calibration_set"  # or "client_local_labels"
   calibration_fraction: 0.05  # fraction of data held server-side for cold-start bootstrap
-  confidence_threshold: 0.7  # cascade decision rule: below this, fall through to autoencoder
   # num_boost_round/learning_rate/num_leaves re-tuned in Phase 5 against
   # real Edge-IIoTset data (original synthetic-tuned defaults were
   # 200/0.05/31). With 95 real features of very uneven importance (e.g.
@@ -45,8 +46,11 @@ autoencoder:
   reconstruction_error_range: [0.0, 10.0]
 
 cascade:
-  # Shared decision rule used consistently across evaluation, dashboard, and SDN bridge.
-  confidence_threshold: 0.7  # mirrors boosting.confidence_threshold; single source of truth
+  # Shared decision rule used consistently across boosting's filter,
+  # evaluation, dashboard, and SDN bridge. The ONLY home for this
+  # threshold -- fl_ids.models.boosting.BoostingClassifier takes it as an
+  # explicit constructor arg sourced from here, never a separate field.
+  confidence_threshold: 0.7
   anomaly_confidence_clip: [0.0, 1.0]
 
 fl:

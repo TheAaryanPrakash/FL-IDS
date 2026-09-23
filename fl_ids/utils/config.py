@@ -28,9 +28,12 @@ class DataConfig:
 
 @dataclass
 class BoostingConfig:
+    # Note: no confidence_threshold field here -- the cascade decision
+    # rule's confidence threshold has exactly one home, CascadeConfig
+    # .confidence_threshold (see fl_ids.models.boosting's module
+    # docstring for why a second, same-shaped field here was a bug).
     label_source: str
     calibration_fraction: float
-    confidence_threshold: float
     num_boost_round: int
     learning_rate: float
     num_leaves: int

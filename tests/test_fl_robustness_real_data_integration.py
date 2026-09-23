@@ -57,7 +57,6 @@ def _write_test_config(path: Path, num_clients: int, num_rounds: int) -> None:
         "boosting": {
             "label_source": "server_held_calibration_set",
             "calibration_fraction": 0.05,
-            "confidence_threshold": 0.6,
             "num_boost_round": 150,
             "learning_rate": 0.1,
             "num_leaves": 63,
@@ -116,7 +115,6 @@ def real_robustness_run_artifacts(tmp_path_factory):
     boosting_config = BoostingConfig(
         label_source="server_held_calibration_set",
         calibration_fraction=0.05,
-        confidence_threshold=0.6,
         num_boost_round=150,
         learning_rate=0.1,
         num_leaves=63,
@@ -124,7 +122,8 @@ def real_robustness_run_artifacts(tmp_path_factory):
         update_every_n_rounds=3,
     )
     boosting_model = BoostingClassifier(
-        boosting_config, num_classes=len(label_encoder.classes_), benign_class=benign_class, seed=SEED
+        boosting_config, num_classes=len(label_encoder.classes_), benign_class=benign_class, seed=SEED,
+        confidence_threshold=0.6,
     )
     boosting_model.train(X_calib, y_calib)
 

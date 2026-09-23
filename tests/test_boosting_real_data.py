@@ -53,7 +53,6 @@ def test_cold_start_bootstrap_metrics_on_real_data():
     boosting_config = BoostingConfig(
         label_source="server_held_calibration_set",
         calibration_fraction=0.05,
-        confidence_threshold=0.7,
         num_boost_round=300,
         learning_rate=0.1,
         num_leaves=127,
@@ -67,7 +66,8 @@ def test_cold_start_bootstrap_metrics_on_real_data():
     benign_class = int(label_encoder.transform(["Normal"])[0])
 
     boosting_model = BoostingClassifier(
-        boosting_config, num_classes=len(label_encoder.classes_), benign_class=benign_class, seed=42
+        boosting_config, num_classes=len(label_encoder.classes_), benign_class=benign_class, seed=42,
+        confidence_threshold=0.7,
     )
     boosting_model.train(X_calib, y_calib)
 
@@ -121,7 +121,6 @@ def test_boosting_distribution_mechanism_on_real_data():
     boosting_config = BoostingConfig(
         label_source="server_held_calibration_set",
         calibration_fraction=0.05,
-        confidence_threshold=0.7,
         num_boost_round=300,
         learning_rate=0.1,
         num_leaves=127,
@@ -135,13 +134,15 @@ def test_boosting_distribution_mechanism_on_real_data():
     benign_class = int(label_encoder.transform(["Normal"])[0])
 
     server_model = BoostingClassifier(
-        boosting_config, num_classes=len(label_encoder.classes_), benign_class=benign_class, seed=7
+        boosting_config, num_classes=len(label_encoder.classes_), benign_class=benign_class, seed=7,
+        confidence_threshold=0.7,
     )
     server_model.train(X_calib, y_calib)
 
     payload = server_model.to_bytes()
     client_model = BoostingClassifier.from_bytes(
-        payload, boosting_config, num_classes=len(label_encoder.classes_), benign_class=benign_class, seed=7
+        payload, boosting_config, num_classes=len(label_encoder.classes_), benign_class=benign_class, seed=7,
+        confidence_threshold=0.7,
     )
 
     X_sample = client_data[0]["X_test_raw"][:500]

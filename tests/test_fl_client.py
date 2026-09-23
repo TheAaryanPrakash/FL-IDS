@@ -27,7 +27,6 @@ def _boosting_config(**overrides) -> BoostingConfig:
     defaults = dict(
         label_source="server_held_calibration_set",
         calibration_fraction=0.05,
-        confidence_threshold=0.7,
         num_boost_round=50,
         learning_rate=0.1,
         num_leaves=31,
@@ -94,12 +93,19 @@ def _make_client_and_boosting_model(seed: int = 10):
     # Boosting always trains/predicts on raw features (see
     # fl_ids.models.boosting's module docstring for why per-client
     # normalization must never reach it).
-    boosting_config = _boosting_config(confidence_threshold=0.6)
-    boosting_model = BoostingClassifier(boosting_config, len(class_names), BENIGN_CLASS, seed=seed)
-    boosting_model.train(X_train, y_train)
-
+    boosting_config = _boosting_config()
     autoencoder_config = _autoencoder_config()
     config = _full_config(boosting_config, autoencoder_config)
+
+    # Ground-truth model used below to compute `expected_mask` -- built
+    # with the same confidence_threshold (config.cascade's, the single
+    # source of truth) that fit() will use internally, so the two can't
+    # silently drift apart.
+    boosting_model = BoostingClassifier(
+        boosting_config, len(class_names), BENIGN_CLASS, seed=seed,
+        confidence_threshold=config.cascade.confidence_threshold,
+    )
+    boosting_model.train(X_train, y_train)
 
     # The autoencoder trains on a *different* (normalized) representation
     # of the same rows -- mirrors component 1's per-client scaler, fit

@@ -54,7 +54,6 @@ def _write_test_config(path: Path, num_clients: int, num_rounds: int, input_dim_
         "boosting": {
             "label_source": "server_held_calibration_set",
             "calibration_fraction": 0.1,
-            "confidence_threshold": 0.6,
             "num_boost_round": 50,
             "learning_rate": 0.1,
             "num_leaves": 31,
@@ -110,14 +109,15 @@ def fl_run_artifacts(tmp_path_factory):
     boosting_config = BoostingConfig(
         label_source="server_held_calibration_set",
         calibration_fraction=0.1,
-        confidence_threshold=0.6,
         num_boost_round=50,
         learning_rate=0.1,
         num_leaves=31,
         broadcast_every_n_rounds=1,
         update_every_n_rounds=3,
     )
-    boosting_model = BoostingClassifier(boosting_config, len(class_names), benign_class=0, seed=SEED)
+    boosting_model = BoostingClassifier(
+        boosting_config, len(class_names), benign_class=0, seed=SEED, confidence_threshold=0.6
+    )
     boosting_model.train(X_calib, y_calib)
 
     data_config = DataConfig(

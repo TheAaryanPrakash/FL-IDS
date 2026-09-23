@@ -14,4 +14,7 @@ def test_config_loads():
     assert config.seed == 42
     assert config.data.num_clients > 0
     assert 0.0 < config.data.dirichlet_alpha <= 1.0
-    assert config.boosting.confidence_threshold == config.cascade.confidence_threshold
+    # Cascade confidence threshold has exactly one home -- see
+    # fl_ids.models.boosting's module docstring.
+    assert 0.0 < config.cascade.confidence_threshold <= 1.0
+    assert not hasattr(config.boosting, "confidence_threshold")

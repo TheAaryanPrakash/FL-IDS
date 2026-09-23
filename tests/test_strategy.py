@@ -41,7 +41,7 @@ def _full_config() -> Config:
         ),
         boosting=BoostingConfig(
             label_source="server_held_calibration_set", calibration_fraction=0.05,
-            confidence_threshold=0.7, num_boost_round=50, learning_rate=0.1, num_leaves=31,
+            num_boost_round=50, learning_rate=0.1, num_leaves=31,
             broadcast_every_n_rounds=1, update_every_n_rounds=3,
         ),
         autoencoder=AutoencoderConfig(

@@ -57,6 +57,7 @@ class AutoencoderClient(NumPyClient):
         X_val_benign: np.ndarray,
         config: Config,
         input_dim: int,
+        use_boosting_filter: bool = True,
     ) -> None:
         """Initialize the client.
 
@@ -73,12 +74,19 @@ class AutoencoderClient(NumPyClient):
                 round.
             config: Full project config.
             input_dim: Number of input features (autoencoder input width).
+            use_boosting_filter: When False, trains on *all* local traffic
+                unfiltered instead of the boosting-confident-"normal"
+                subset. Default True is component 3's actual requirement;
+                False exists only to support the "autoencoder-only (no
+                boosting pre-filter)" ablation row (component 12) — never
+                the default for real training.
         """
         self.client_id = client_id
         self.X_train = X_train
         self.X_train_raw = X_train_raw
         self.X_val_benign = X_val_benign
         self.config = config
+        self.use_boosting_filter = use_boosting_filter
         self.model = Autoencoder(
             input_dim, config.autoencoder.hidden_dims, config.autoencoder.bottleneck_dim
         )
@@ -113,9 +121,13 @@ class AutoencoderClient(NumPyClient):
             num_classes=int(config["num_classes"]),
             benign_class=int(config["benign_class"]),
             seed=self.config.seed,
+            confidence_threshold=self.config.cascade.confidence_threshold,
         )
 
-        mask = boosting_model.passes_to_autoencoder(self.X_train_raw)
+        if self.use_boosting_filter:
+            mask = boosting_model.passes_to_autoencoder(self.X_train_raw)
+        else:
+            mask = np.ones(len(self.X_train_raw), dtype=bool)
         X_filtered = self.X_train[mask]
         self.last_filtered_fraction = float(mask.mean()) if len(mask) else 0.0
 

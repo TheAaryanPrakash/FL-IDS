@@ -21,11 +21,13 @@ from fl_ids.utils.config import BoostingConfig
 BENIGN_CLASS = 0  # "Normal" is index 0 in make_synthetic_attack_dataset's default classes
 
 
+CONFIDENCE_THRESHOLD = 0.7  # stand-in for CascadeConfig.confidence_threshold in these tests
+
+
 def _boosting_config(**overrides) -> BoostingConfig:
     defaults = dict(
         label_source="server_held_calibration_set",
         calibration_fraction=0.05,
-        confidence_threshold=0.7,
         num_boost_round=100,
         learning_rate=0.1,
         num_leaves=31,
@@ -40,7 +42,10 @@ def test_boosting_classifier_trains_and_predicts_valid_probabilities():
     X, y, class_names = make_synthetic_attack_dataset(n_samples=2000, seed=1)
     X_train, X_test, y_train, _ = train_test_split(X, y, test_size=0.3, random_state=1, stratify=y)
 
-    clf = BoostingClassifier(_boosting_config(), num_classes=len(class_names), benign_class=BENIGN_CLASS, seed=1)
+    clf = BoostingClassifier(
+        _boosting_config(), num_classes=len(class_names), benign_class=BENIGN_CLASS, seed=1,
+        confidence_threshold=CONFIDENCE_THRESHOLD,
+    )
     assert not clf.is_trained
     clf.train(X_train, y_train)
     assert clf.is_trained
@@ -52,7 +57,10 @@ def test_boosting_classifier_trains_and_predicts_valid_probabilities():
 
 
 def test_predict_proba_before_training_raises():
-    clf = BoostingClassifier(_boosting_config(), num_classes=5, benign_class=BENIGN_CLASS, seed=1)
+    clf = BoostingClassifier(
+        _boosting_config(), num_classes=5, benign_class=BENIGN_CLASS, seed=1,
+        confidence_threshold=CONFIDENCE_THRESHOLD,
+    )
     with pytest.raises(RuntimeError):
         clf.predict_proba(np.zeros((3, 4)))
 
@@ -72,7 +80,10 @@ def test_cold_start_bootstrap_metrics_on_held_out_slice():
         X, y, train_size=config.calibration_fraction, random_state=2, stratify=y
     )
 
-    clf = BoostingClassifier(config, num_classes=len(class_names), benign_class=BENIGN_CLASS, seed=2)
+    clf = BoostingClassifier(
+        config, num_classes=len(class_names), benign_class=BENIGN_CLASS, seed=2,
+        confidence_threshold=CONFIDENCE_THRESHOLD,
+    )
     clf.train(X_calib, y_calib)
 
     y_pred = np.argmax(clf.predict_proba(X_held_out), axis=1)
@@ -101,14 +112,13 @@ def test_cascade_stage1_confidence_threshold_controls_fallthrough():
 
     # Well-separated synthetic classes -> the model should be confident on
     # correctly-classified attack samples.
-    high_threshold_config = _boosting_config(confidence_threshold=0.999)
-    low_threshold_config = _boosting_config(confidence_threshold=0.01)
+    boosting_config = _boosting_config()
 
-    clf_high = BoostingClassifier(high_threshold_config, len(class_names), BENIGN_CLASS, seed=3)
+    clf_high = BoostingClassifier(boosting_config, len(class_names), BENIGN_CLASS, seed=3, confidence_threshold=0.999)
     clf_high.train(X_train, y_train)
     result_high = clf_high.predict_cascade_stage1(X_test)
 
-    clf_low = BoostingClassifier(low_threshold_config, len(class_names), BENIGN_CLASS, seed=3)
+    clf_low = BoostingClassifier(boosting_config, len(class_names), BENIGN_CLASS, seed=3, confidence_threshold=0.01)
     clf_low._booster = clf_high._booster  # identical underlying model, different threshold only
     result_low = clf_low.predict_cascade_stage1(X_test)
 
@@ -130,7 +140,9 @@ def test_passes_to_autoencoder_is_complement_of_confident_attack():
     X, y, class_names = make_synthetic_attack_dataset(n_samples=2000, seed=4)
     X_train, X_test, y_train, _ = train_test_split(X, y, test_size=0.3, random_state=4, stratify=y)
 
-    clf = BoostingClassifier(_boosting_config(), len(class_names), BENIGN_CLASS, seed=4)
+    clf = BoostingClassifier(
+        _boosting_config(), len(class_names), BENIGN_CLASS, seed=4, confidence_threshold=CONFIDENCE_THRESHOLD
+    )
     clf.train(X_train, y_train)
 
     stage1 = clf.predict_cascade_stage1(X_test)
@@ -148,7 +160,9 @@ def test_serialization_round_trip_matches_original_predictions():
     X_train, X_test, y_train, _ = train_test_split(X, y, test_size=0.3, random_state=5, stratify=y)
 
     config = _boosting_config()
-    server_clf = BoostingClassifier(config, len(class_names), BENIGN_CLASS, seed=5)
+    server_clf = BoostingClassifier(
+        config, len(class_names), BENIGN_CLASS, seed=5, confidence_threshold=CONFIDENCE_THRESHOLD
+    )
     server_clf.train(X_train, y_train)
 
     payload = server_clf.to_bytes()
@@ -156,7 +170,8 @@ def test_serialization_round_trip_matches_original_predictions():
     assert len(payload) > 0
 
     client_clf = BoostingClassifier.from_bytes(
-        payload, config, num_classes=len(class_names), benign_class=BENIGN_CLASS, seed=5
+        payload, config, num_classes=len(class_names), benign_class=BENIGN_CLASS, seed=5,
+        confidence_threshold=CONFIDENCE_THRESHOLD,
     )
     assert client_clf.is_trained
 
@@ -170,6 +185,9 @@ def test_serialization_round_trip_matches_original_predictions():
 
 
 def test_to_bytes_before_training_raises():
-    clf = BoostingClassifier(_boosting_config(), num_classes=5, benign_class=BENIGN_CLASS, seed=1)
+    clf = BoostingClassifier(
+        _boosting_config(), num_classes=5, benign_class=BENIGN_CLASS, seed=1,
+        confidence_threshold=CONFIDENCE_THRESHOLD,
+    )
     with pytest.raises(RuntimeError):
         clf.to_bytes()
