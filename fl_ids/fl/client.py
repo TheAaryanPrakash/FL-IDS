@@ -180,6 +180,13 @@ if __name__ == "__main__":
     parser.add_argument("--config-path", required=True)
     parser.add_argument("--max-retries", type=int, default=10)
     parser.add_argument("--max-wait-time", type=float, default=30.0)
+    parser.add_argument(
+        "--client-type",
+        choices=["honest", "sign_flip"],
+        default="honest",
+        help="'sign_flip' runs the component 5 test attacker (fl_ids.robustness.attackers)",
+    )
+    parser.add_argument("--amplification", type=float, default=5.0, help="sign_flip attacker's delta amplification")
     args = parser.parse_args()
 
     setup_logging()
@@ -187,7 +194,20 @@ if __name__ == "__main__":
     data = load_client_data(args.data_path)
     input_dim = data["X"].shape[1] if data["X"].shape[0] > 0 else data["X_val_benign"].shape[1]
 
-    client = make_client(args.client_id, data, run_config, input_dim)
+    if args.client_type == "sign_flip":
+        from fl_ids.robustness.attackers import SignFlipAttackerClient
+
+        client = SignFlipAttackerClient(
+            args.client_id,
+            data["X"],
+            data["X_val_benign"],
+            run_config,
+            input_dim,
+            amplification=args.amplification,
+        )
+    else:
+        client = make_client(args.client_id, data, run_config, input_dim)
+
     start_client(
         server_address=args.server_address,
         client=client.to_client(),
