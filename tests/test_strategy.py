@@ -10,6 +10,7 @@ tests/test_fl_robustness_integration.py.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from flwr.common import Code, FitRes, Status, ndarrays_to_parameters, parameters_to_ndarrays
 
 from fl_ids.fl.strategy import TrustFilteredStrategy
@@ -184,3 +185,89 @@ def test_aggregate_fit_with_empty_results_returns_none():
     parameters, metrics = strategy.aggregate_fit(server_round=1, results=[], failures=[])
     assert parameters is None
     assert metrics == {}
+
+
+def test_aggregate_evaluate_merges_reconstruction_error_into_same_round_entry():
+    from flwr.common import Code, EvaluateRes, Status
+
+    config = _full_config()
+    strategy = _make_strategy(config, min_clients=2)
+    strategy._round_start_weights = [np.zeros(10)]
+
+    fit_results = [
+        (_FakeClientProxy("0"), _fit_res([np.ones(10)], client_id=0)),
+        (_FakeClientProxy("1"), _fit_res([np.ones(10)], client_id=1)),
+    ]
+    strategy.aggregate_fit(server_round=1, results=fit_results, failures=[])
+    assert len(strategy.round_history) == 1
+    assert "mean_reconstruction_error" not in strategy.round_history[0]
+
+    evaluate_results = [
+        (
+            _FakeClientProxy("0"),
+            EvaluateRes(status=Status(Code.OK, "ok"), loss=0.5, num_examples=10, metrics={"client_id": 0, "anomaly_threshold": 1.2}),
+        ),
+        (
+            _FakeClientProxy("1"),
+            EvaluateRes(status=Status(Code.OK, "ok"), loss=0.7, num_examples=10, metrics={"client_id": 1, "anomaly_threshold": 1.4}),
+        ),
+    ]
+    strategy.aggregate_evaluate(server_round=1, results=evaluate_results, failures=[])
+
+    assert len(strategy.round_history) == 1  # merged into the same entry, not a new one
+    entry = strategy.round_history[0]
+    assert entry["round"] == 1
+    assert entry["mean_reconstruction_error"] == pytest.approx(0.6)
+    assert entry["per_client_reconstruction_error"] == {0: 0.5, 1: 0.7}
+    assert entry["per_client_anomaly_threshold"] == {0: 1.2, 1: 1.4}
+
+
+def test_live_state_path_is_written_after_each_round(tmp_path):
+    config = _full_config()
+    state_path = tmp_path / "live_state.json"
+    strategy = TrustFilteredStrategy(
+        config,
+        boosting_model_bytes=b"fake-model-bytes",
+        num_classes=5,
+        benign_class=0,
+        live_state_path=state_path,
+        fraction_fit=1.0,
+        fraction_evaluate=1.0,
+        min_fit_clients=2,
+        min_evaluate_clients=2,
+        min_available_clients=2,
+    )
+    strategy._round_start_weights = [np.zeros(10)]
+
+    fit_results = [(_FakeClientProxy("0"), _fit_res([np.ones(10)], client_id=0))]
+    strategy.aggregate_fit(server_round=1, results=fit_results, failures=[])
+
+    assert state_path.exists()
+    import json
+
+    written = json.loads(state_path.read_text())
+    assert len(written) == 1
+    assert written[0]["round"] == 1
+
+
+def test_round_history_records_broadcast_boosting_model_version_and_metrics():
+    config = _full_config()
+    metrics = {"accuracy": 0.9, "weighted_f1": 0.88, "macro_f1": 0.7, "false_positive_rate": 0.02, "per_class": {}}
+    strategy = TrustFilteredStrategy(
+        config,
+        boosting_model_bytes=b"fake-model-bytes",
+        num_classes=5,
+        benign_class=0,
+        boosting_metrics=metrics,
+        fraction_fit=1.0,
+        min_fit_clients=2,
+        min_available_clients=2,
+    )
+    strategy._round_start_weights = [np.zeros(10)]
+
+    fit_results = [(_FakeClientProxy("0"), _fit_res([np.ones(10)], client_id=0))]
+    strategy.aggregate_fit(server_round=1, results=fit_results, failures=[])
+
+    entry = strategy.round_history[0]
+    assert entry["boosting_model_version"] == 1
+    assert entry["boosting_metrics"] == metrics

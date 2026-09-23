@@ -155,3 +155,143 @@ def test_clear_mitigation_without_prior_rate_limit_only_deletes_flow():
 def test_get_datapath_ids_reflects_connected_switches():
     controller, _ = _controller_with_fake_datapath(dp_id=42)
     assert controller.get_datapath_ids() == [42]
+
+
+# --- Live switch-state queries (read by the dashboard, component 13) ------
+
+from types import SimpleNamespace  # noqa: E402
+
+from os_ken.ofproto import ofproto_v1_3, ofproto_v1_3_parser  # noqa: E402
+
+from fl_ids.sdn import controller as controller_module  # noqa: E402
+from fl_ids.sdn.controller import describe_instructions  # noqa: E402
+
+
+class StatsDatapath:
+    """Answers each stats request by feeding canned reply parts straight back to the controller.
+
+    Uses os-ken's real OpenFlow 1.3 ofproto/parser, so the stats-request
+    objects and instruction classes are the real ones.
+    """
+
+    def __init__(self, controller: MitigationController, dp_id: int, replies_by_request: dict[str, list[list]]):
+        self.id = dp_id
+        self.ofproto = ofproto_v1_3
+        self.ofproto_parser = ofproto_v1_3_parser
+        self._controller = controller
+        self._replies = replies_by_request
+        self._next_xid = 1
+
+    def set_xid(self, msg):
+        msg.xid = self._next_xid
+        self._next_xid += 1
+
+    def send_msg(self, msg):
+        parts = self._replies.get(type(msg).__name__)
+        if parts is None:
+            return  # never answer: exercises the timeout path
+        for i, body in enumerate(parts):
+            flags = ofproto_v1_3.OFPMPF_REPLY_MORE if i < len(parts) - 1 else 0
+            reply = SimpleNamespace(xid=msg.xid, body=body, flags=flags, datapath=self)
+            self._controller._on_stats_reply(SimpleNamespace(msg=reply))
+
+
+def _flow_stat(priority, match, instructions, packets=0):
+    return SimpleNamespace(
+        priority=priority, match=match, instructions=instructions,
+        packet_count=packets, byte_count=packets * 100, duration_sec=5,
+    )
+
+
+def test_describe_instructions_renders_drop_meter_and_normal():
+    p = ofproto_v1_3_parser
+    normal = p.OFPInstructionActions(ofproto_v1_3.OFPIT_APPLY_ACTIONS, [p.OFPActionOutput(ofproto_v1_3.OFPP_NORMAL)])
+    assert describe_instructions([], ofproto_v1_3) == "drop"
+    assert describe_instructions([normal], ofproto_v1_3) == "output:NORMAL"
+    assert describe_instructions([p.OFPInstructionMeter(1000), normal], ofproto_v1_3) == "meter:1000,output:NORMAL"
+
+
+def test_get_flow_table_accumulates_multipart_reply_and_sorts_by_priority():
+    p = ofproto_v1_3_parser
+    normal = p.OFPInstructionActions(ofproto_v1_3.OFPIT_APPLY_ACTIONS, [p.OFPActionOutput(ofproto_v1_3.OFPP_NORMAL)])
+    default_flow = _flow_stat(0, p.OFPMatch(), [normal], packets=500)
+    block_flow = _flow_stat(100, p.OFPMatch(eth_type=0x0800, ipv4_src="10.0.0.1"), [], packets=42)
+
+    controller = MitigationController()
+    # Two reply parts: the second only arrives after REPLY_MORE on the first.
+    controller.datapaths[1] = StatsDatapath(controller, 1, {"OFPFlowStatsRequest": [[default_flow], [block_flow]]})
+
+    flows = controller.get_flow_table(1)
+    assert flows == [
+        {
+            "priority": 100, "match": {"eth_type": 0x0800, "ipv4_src": "10.0.0.1"}, "actions": "drop",
+            "packet_count": 42, "byte_count": 4200, "duration_sec": 5,
+        },
+        {
+            "priority": 0, "match": {}, "actions": "output:NORMAL",
+            "packet_count": 500, "byte_count": 50000, "duration_sec": 5,
+        },
+    ]
+    assert controller._pending_stats == {}
+
+
+def test_get_port_status_joins_description_with_counters_and_skips_local_port():
+    up = SimpleNamespace(port_no=1, name=b"s1-eth1", state=0, config=0)
+    down = SimpleNamespace(port_no=2, name=b"s1-eth2", state=ofproto_v1_3.OFPPS_LINK_DOWN, config=0)
+    local = SimpleNamespace(port_no=ofproto_v1_3.OFPP_LOCAL, name=b"s1", state=0, config=0)
+    counters = SimpleNamespace(
+        port_no=1, rx_packets=10, tx_packets=20, rx_bytes=1000, tx_bytes=2000, rx_dropped=1, tx_dropped=0
+    )
+
+    controller = MitigationController()
+    controller.datapaths[1] = StatsDatapath(
+        controller, 1,
+        {"OFPPortDescStatsRequest": [[up, down, local]], "OFPPortStatsRequest": [[counters]]},
+    )
+
+    ports = controller.get_port_status(1)
+    assert [p["name"] for p in ports] == ["s1-eth1", "s1-eth2"]
+    assert ports[0]["link_up"] is True and ports[0]["rx_packets"] == 10
+    assert ports[1]["link_up"] is False and ports[1]["rx_packets"] == 0
+
+
+def test_get_meter_stats_sums_band_drops():
+    meter = SimpleNamespace(
+        meter_id=1000, flow_count=1, packet_in_count=300, byte_in_count=30000,
+        band_stats=[SimpleNamespace(packet_band_count=120)],
+    )
+    controller = MitigationController()
+    controller.datapaths[1] = StatsDatapath(controller, 1, {"OFPMeterStatsRequest": [[meter]]})
+
+    assert controller.get_meter_stats(1) == [
+        {"meter_id": 1000, "flow_count": 1, "packet_in_count": 300, "byte_in_count": 30000, "packets_dropped_by_band": 120}
+    ]
+
+
+class _NeverSetEvent:
+    """Stands in for `hub.Event` on the timeout path: eventlet's Timeout only
+    fires inside a monkey-patched greenthread (as in the real bridge), not
+    in a plain pytest process, so the real Event would block forever here.
+    """
+
+    def set(self):
+        pass
+
+    def wait(self, timeout=None):
+        return False
+
+
+def test_stats_query_returns_none_when_switch_never_answers(monkeypatch):
+    monkeypatch.setattr(controller_module.hub, "Event", _NeverSetEvent)
+    controller = MitigationController()
+    controller.datapaths[1] = StatsDatapath(controller, 1, {})
+
+    assert controller.get_flow_table(1) is None
+    assert controller._pending_stats == {}
+
+
+def test_stats_queries_return_none_for_unknown_datapath():
+    controller = MitigationController()
+    assert controller.get_flow_table(7) is None
+    assert controller.get_meter_stats(7) is None
+    assert controller.get_port_status(7) is None

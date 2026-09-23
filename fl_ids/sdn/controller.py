@@ -25,7 +25,8 @@ import threading
 
 from os_ken.base import app_manager
 from os_ken.controller import ofp_event
-from os_ken.controller.handler import CONFIG_DISPATCHER, set_ev_cls
+from os_ken.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+from os_ken.lib import hub
 from os_ken.ofproto import ofproto_v1_3
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,29 @@ PRIORITY_DEFAULT = 0
 PRIORITY_MITIGATION = 100
 
 METER_ID_BASE = 1000  # meter IDs are allocated per-device starting here
+
+STATS_REPLY_TIMEOUT_S = 3.0  # how long a stats query waits for the switch to answer
+
+
+def describe_instructions(instructions: list, ofproto) -> str:
+    """Render a flow entry's OpenFlow 1.3 instructions as a short human-readable string.
+
+    An empty instruction list is OpenFlow's drop, so it renders as `"drop"`
+    -- exactly what a block mitigation installs.
+    """
+    parts = []
+    for inst in instructions:
+        if hasattr(inst, "meter_id"):
+            parts.append(f"meter:{inst.meter_id}")
+        for action in getattr(inst, "actions", None) or []:
+            port = getattr(action, "port", None)
+            if port == ofproto.OFPP_NORMAL:
+                parts.append("output:NORMAL")
+            elif port is not None:
+                parts.append(f"output:{port}")
+            else:
+                parts.append(type(action).__name__)
+    return ",".join(parts) if parts else "drop"
 
 
 class MitigationController(app_manager.OSKenApp):
@@ -51,6 +75,8 @@ class MitigationController(app_manager.OSKenApp):
         self._meter_ids: dict[tuple[int, str], int] = {}
         self._next_meter_id = METER_ID_BASE
         self._lock = threading.Lock()
+        # xid -> (event set on the final reply part, accumulated reply bodies).
+        self._pending_stats: dict[int, tuple[hub.Event, list]] = {}
 
     # --- Switch connection lifecycle -------------------------------------
 
@@ -198,6 +224,158 @@ class MitigationController(app_manager.OSKenApp):
 
         logger.info("Cleared mitigation: datapath_id=%s device_ip=%s", datapath_id, device_ip)
         return True
+
+    # --- Live switch state (read by the dashboard, component 13) --------
+    #
+    # Every value below is queried from the switch itself via OpenFlow
+    # multipart requests at call time -- not a record of what this
+    # controller *thinks* it installed -- so the dashboard shows the
+    # actual flow table, the same thing `ovs-ofctl dump-flows` shows.
+
+    def get_flow_table(self, datapath_id: int) -> list[dict] | None:
+        """Query the switch's current flow table.
+
+        Returns:
+            One dict per flow entry (priority, match, actions, packet/byte
+            counters, age), highest priority first; None if the datapath
+            isn't connected or doesn't answer in time.
+        """
+        datapath = self._get_datapath(datapath_id)
+        if datapath is None:
+            return None
+        body = self._request_stats(datapath, datapath.ofproto_parser.OFPFlowStatsRequest(datapath))
+        if body is None:
+            return None
+        flows = [
+            {
+                "priority": stat.priority,
+                "match": dict(stat.match.items()),
+                "actions": describe_instructions(stat.instructions, datapath.ofproto),
+                "packet_count": stat.packet_count,
+                "byte_count": stat.byte_count,
+                "duration_sec": stat.duration_sec,
+            }
+            for stat in body
+        ]
+        return sorted(flows, key=lambda f: -f["priority"])
+
+    def get_meter_stats(self, datapath_id: int) -> list[dict] | None:
+        """Query the switch's meter counters -- how much traffic each rate-limit meter saw and dropped.
+
+        Returns:
+            One dict per meter; None if the datapath isn't connected or
+            doesn't answer in time.
+        """
+        datapath = self._get_datapath(datapath_id)
+        if datapath is None:
+            return None
+        request = datapath.ofproto_parser.OFPMeterStatsRequest(datapath, 0, datapath.ofproto.OFPM_ALL)
+        body = self._request_stats(datapath, request)
+        if body is None:
+            return None
+        return [
+            {
+                "meter_id": stat.meter_id,
+                "flow_count": stat.flow_count,
+                "packet_in_count": stat.packet_in_count,
+                "byte_in_count": stat.byte_in_count,
+                "packets_dropped_by_band": sum(band.packet_band_count for band in stat.band_stats),
+            }
+            for stat in body
+        ]
+
+    def get_port_status(self, datapath_id: int) -> list[dict] | None:
+        """Query the switch's ports: name, link state, and live traffic counters.
+
+        Combines a port-description request (names, link up/down) with a
+        port-stats request (rx/tx packets, bytes, drops).
+
+        Returns:
+            One dict per port, ordered by port number; None if the datapath
+            isn't connected or doesn't answer in time.
+        """
+        datapath = self._get_datapath(datapath_id)
+        if datapath is None:
+            return None
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+        desc_body = self._request_stats(datapath, parser.OFPPortDescStatsRequest(datapath, 0))
+        stats_body = self._request_stats(datapath, parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY))
+        if desc_body is None or stats_body is None:
+            return None
+
+        stats_by_port = {stat.port_no: stat for stat in stats_body}
+        ports = []
+        for desc in desc_body:
+            if desc.port_no > ofproto.OFPP_MAX:  # the switch's LOCAL port, not a link
+                continue
+            name = desc.name.decode(errors="replace") if isinstance(desc.name, bytes) else str(desc.name)
+            link_up = not (desc.state & ofproto.OFPPS_LINK_DOWN) and not (desc.config & ofproto.OFPPC_PORT_DOWN)
+            stat = stats_by_port.get(desc.port_no)
+            ports.append(
+                {
+                    "port_no": desc.port_no,
+                    "name": name.rstrip("\x00"),
+                    "link_up": bool(link_up),
+                    **{
+                        counter: getattr(stat, counter, 0)
+                        for counter in ("rx_packets", "tx_packets", "rx_bytes", "tx_bytes", "rx_dropped", "tx_dropped")
+                    },
+                }
+            )
+        return sorted(ports, key=lambda p: p["port_no"])
+
+    def _request_stats(self, datapath, request) -> list | None:
+        """Send a multipart stats request and wait (cooperatively) for its full reply.
+
+        The reply handlers below run on the same eventlet hub, so waiting
+        on a `hub.Event` yields to them rather than deadlocking. A reply
+        can arrive split across several messages (OFPMPF_REPLY_MORE);
+        bodies accumulate until the last part.
+
+        Returns:
+            The concatenated reply body, or None on timeout.
+        """
+        datapath.set_xid(request)
+        event = hub.Event()
+        with self._lock:
+            self._pending_stats[request.xid] = (event, [])
+        datapath.send_msg(request)
+        replied = event.wait(timeout=STATS_REPLY_TIMEOUT_S)
+        with self._lock:
+            _, body = self._pending_stats.pop(request.xid, (None, []))
+        if not replied:
+            logger.warning("Stats request %s to datapath_id=%s timed out", type(request).__name__, datapath.id)
+            return None
+        return body
+
+    def _on_stats_reply(self, ev) -> None:
+        """Shared handler for every multipart reply type: route the body to its waiting request by xid."""
+        msg = ev.msg
+        with self._lock:
+            pending = self._pending_stats.get(msg.xid)
+            if pending is None:
+                return
+            event, body = pending
+            body.extend(msg.body)
+        if not (msg.flags & msg.datapath.ofproto.OFPMPF_REPLY_MORE):
+            event.set()
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def _on_flow_stats_reply(self, ev) -> None:
+        self._on_stats_reply(ev)
+
+    @set_ev_cls(ofp_event.EventOFPMeterStatsReply, MAIN_DISPATCHER)
+    def _on_meter_stats_reply(self, ev) -> None:
+        self._on_stats_reply(ev)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def _on_port_stats_reply(self, ev) -> None:
+        self._on_stats_reply(ev)
+
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
+    def _on_port_desc_stats_reply(self, ev) -> None:
+        self._on_stats_reply(ev)
 
     def _get_datapath(self, datapath_id: int):
         with self._lock:

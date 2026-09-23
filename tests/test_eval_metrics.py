@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 from sklearn.model_selection import train_test_split
 
@@ -11,6 +13,7 @@ from fl_ids.eval.metrics import (
     evaluate_autoencoder_alone,
     evaluate_boosting_alone,
     evaluate_cascade,
+    stage_report_summary,
 )
 from fl_ids.models.autoencoder import Autoencoder, compute_anomaly_threshold, reconstruction_error, train_autoencoder
 from fl_ids.models.boosting import BoostingClassifier
@@ -112,3 +115,13 @@ def test_build_per_stage_table_combines_all_reports():
 
     assert set(table["stage"].unique()) == {"boosting_alone", "autoencoder_alone", "cascade_combined"}
     assert {"precision", "recall", "f1", "auroc", "stage_accuracy", "stage_false_positive_rate"}.issubset(table.columns)
+
+
+def test_stage_report_summary_is_json_serializable_and_matches_report():
+    boosting_model, _, _, _, class_names, X_test, y_test = _build_pipeline()
+    report = evaluate_boosting_alone(boosting_model, X_test, y_test, class_names, BENIGN_CLASS)
+
+    summary = stage_report_summary(report)
+    assert json.loads(json.dumps(summary)) == summary
+    assert summary["accuracy"] == report.accuracy
+    assert set(summary["per_class"]) == set(class_names)

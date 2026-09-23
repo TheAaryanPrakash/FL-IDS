@@ -222,6 +222,27 @@ def run_live_pcap_demo(
     )
     logger.info("Cascade models ready (anomaly threshold=%.4f)", threshold)
 
+    # Register every host with the bridge up front (not just the replaying
+    # one, and before any traffic flows), so the dashboard's device and
+    # topology panels are populated for the whole run.
+    health = requests.get(f"{bridge_url}/health", timeout=5).json()
+    datapath_ids = health["connected_datapaths"]
+    if not datapath_ids:
+        raise RuntimeError("No datapath connected to the controller yet")
+    for host_name, host_ip in host_ip_map(net, len(net.hosts)).items():
+        link = net.get(host_name).defaultIntf().link
+        switch_intf = link.intf2 if link.intf1.node.name == host_name else link.intf1
+        requests.post(
+            f"{bridge_url}/devices/register",
+            json={
+                "device_id": host_name,
+                "datapath_id": datapath_ids[0],
+                "ip_address": host_ip,
+                "port_name": switch_intf.name,
+            },
+            timeout=5,
+        )
+
     _tcpreplay_output, packets_before, packets_after = replay_pcap(net, pcap_path, replay_host_name=replay_host_name)
     if packets_after <= packets_before:
         logger.warning(
@@ -239,35 +260,35 @@ def run_live_pcap_demo(
 
     # Aggregate per-packet cascade output to one device-level classification:
     # the most frequent non-benign label, if any packet triggered one,
-    # else "benign". Confidence is that label's mean confidence.
+    # else "benign". Confidence is that label's mean confidence, and the
+    # reported cascade stage is whichever stage made that label's calls.
     non_benign_mask = output.predicted_label != "benign"
     if non_benign_mask.any():
         labels, counts = np.unique(output.predicted_label[non_benign_mask], return_counts=True)
         device_classification = labels[np.argmax(counts)]
-        device_confidence = float(output.confidence[non_benign_mask & (output.predicted_label == device_classification)].mean())
+        label_mask = non_benign_mask & (output.predicted_label == device_classification)
+        device_confidence = float(output.confidence[label_mask].mean())
     else:
         device_classification = "benign"
+        label_mask = np.ones(len(output.predicted_label), dtype=bool)
         device_confidence = float(output.confidence.mean())
+    stages, stage_counts = np.unique(output.stage[label_mask], return_counts=True)
+    device_stage = str(stages[np.argmax(stage_counts)])
 
     logger.info(
-        "Device-level classification for %s: %s (confidence=%.3f, %d/%d packets non-benign)",
-        replay_host_name, device_classification, device_confidence, non_benign_mask.sum(), len(output.predicted_label),
+        "Device-level classification for %s: %s (confidence=%.3f, stage=%s, %d/%d packets non-benign)",
+        replay_host_name, device_classification, device_confidence, device_stage,
+        non_benign_mask.sum(), len(output.predicted_label),
     )
 
-    device_ip = host_ip_map(net, len(net.hosts))[replay_host_name]
-    health = requests.get(f"{bridge_url}/health", timeout=5).json()
-    datapath_ids = health["connected_datapaths"]
-    if not datapath_ids:
-        raise RuntimeError("No datapath connected to the controller yet")
-
-    requests.post(
-        f"{bridge_url}/devices/register",
-        json={"device_id": replay_host_name, "datapath_id": datapath_ids[0], "ip_address": device_ip},
-        timeout=5,
-    )
     response = requests.post(
         f"{bridge_url}/mitigate",
-        json={"device_id": replay_host_name, "classification": device_classification, "confidence": device_confidence},
+        json={
+            "device_id": replay_host_name,
+            "classification": device_classification,
+            "confidence": device_confidence,
+            "stage": device_stage,
+        },
         timeout=5,
     )
     result = response.json()
@@ -328,6 +349,10 @@ if __name__ == "__main__":
     parser.add_argument("--replay-pcap", default=None, help="Run the live classification+mitigation demo with this .pcap")
     parser.add_argument("--real-csv-path", default="data/raw/DNN-EdgeIIoT-dataset.csv")
     parser.add_argument("--bridge-url", default="http://127.0.0.1:8080")
+    parser.add_argument(
+        "--hold-seconds", type=float, default=0.0,
+        help="Keep the topology up this long after the demo, so the dashboard can observe the mitigated state",
+    )
     parser.set_defaults(**file_defaults)
     args = parser.parse_args()
 
@@ -335,6 +360,11 @@ if __name__ == "__main__":
     try:
         if args.replay_pcap:
             run_live_pcap_demo(mininet_net, args.replay_pcap, args.real_csv_path, args.bridge_url)
+        if args.hold_seconds > 0:
+            import time
+
+            logger.info("Holding topology up for %.0fs", args.hold_seconds)
+            time.sleep(args.hold_seconds)
         if args.cli:
             CLI(mininet_net)
     finally:

@@ -18,6 +18,7 @@ needs the real controller and its eventlet-based event loop.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from fl_ids.models.cascade import BENIGN_LABEL
@@ -30,9 +31,15 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_RATE_LIMIT_KBPS = 1000
 
+CASCADE_STAGES = ("boosting", "autoencoder")
+
 
 class DeviceRegistry:
-    """Maps device_id -> (datapath_id, ip_address).
+    """Maps device_id -> (datapath_id, ip_address, port_name).
+
+    `port_name` (the switch-side interface the device hangs off, e.g.
+    `s1-eth1`) is optional -- mitigation only needs the IP -- but lets the
+    dashboard line up a device with its port's link status and counters.
 
     Populated by the Mininet topology script (component 10) or a test
     harness at startup — not persisted; a real deployment would source
@@ -40,18 +47,20 @@ class DeviceRegistry:
     """
 
     def __init__(self) -> None:
-        self._devices: dict[str, tuple[int, str]] = {}
+        self._devices: dict[str, tuple[int, str, str | None]] = {}
 
-    def register(self, device_id: str, datapath_id: int, ip_address: str) -> None:
-        self._devices[device_id] = (datapath_id, ip_address)
+    def register(self, device_id: str, datapath_id: int, ip_address: str, port_name: str | None = None) -> None:
+        self._devices[device_id] = (datapath_id, ip_address, port_name)
 
     def lookup(self, device_id: str) -> tuple[int, str] | None:
-        return self._devices.get(device_id)
+        """Return `(datapath_id, ip_address)` for a device, or None if unregistered."""
+        entry = self._devices.get(device_id)
+        return entry[:2] if entry else None
 
-    def as_dict(self) -> dict[str, dict[str, str | int]]:
+    def as_dict(self) -> dict[str, dict[str, str | int | None]]:
         return {
-            device_id: {"datapath_id": dp_id, "ip_address": ip}
-            for device_id, (dp_id, ip) in self._devices.items()
+            device_id: {"datapath_id": dp_id, "ip_address": ip, "port_name": port_name}
+            for device_id, (dp_id, ip, port_name) in self._devices.items()
         }
 
 
@@ -96,13 +105,24 @@ def create_bridge_app(
     from flask import Flask, jsonify, request
 
     app = Flask(__name__)
+    mitigation_history: list[dict] = []
 
     @app.route("/mitigate", methods=["POST"])
     def mitigate():
+        """Apply the mitigation for one cascade classification.
+
+        Body: `{device_id, classification, confidence, stage?}` -- `stage`
+        (`"boosting"` or `"autoencoder"`, which cascade stage made the
+        call) is optional for the mitigation decision itself but recorded
+        in the history the dashboard reads.
+        """
         payload = request.get_json(force=True)
         device_id = payload["device_id"]
         classification = payload["classification"]
         confidence = float(payload["confidence"])
+        stage = payload.get("stage")
+        if stage is not None and stage not in CASCADE_STAGES:
+            return jsonify({"error": f"stage must be one of {CASCADE_STAGES}, got {stage!r}"}), 400
 
         entry = registry.lookup(device_id)
         if entry is None:
@@ -121,17 +141,19 @@ def create_bridge_app(
             "Mitigation: device_id=%s ip=%s classification=%s confidence=%.3f -> action=%s applied=%s",
             device_id, ip_address, classification, confidence, action, applied,
         )
+        result = {
+            "timestamp": time.time(),
+            "device_id": device_id,
+            "ip_address": ip_address,
+            "classification": classification,
+            "confidence": confidence,
+            "stage": stage,
+            "action": action,
+            "applied": applied,
+        }
+        mitigation_history.append(result)
         return (
-            jsonify(
-                {
-                    "device_id": device_id,
-                    "ip_address": ip_address,
-                    "classification": classification,
-                    "confidence": confidence,
-                    "action": action,
-                    "applied": applied,
-                }
-            ),
+            jsonify(result),
             200,
         )
 
@@ -145,13 +167,39 @@ def create_bridge_app(
         device_id = payload["device_id"]
         datapath_id = int(payload["datapath_id"])
         ip_address = payload["ip_address"]
-        registry.register(device_id, datapath_id, ip_address)
+        registry.register(device_id, datapath_id, ip_address, port_name=payload.get("port_name"))
         logger.info("Registered device: device_id=%s datapath_id=%d ip=%s", device_id, datapath_id, ip_address)
         return jsonify({"registered": device_id}), 200
 
     @app.route("/health", methods=["GET"])
     def health():
         return jsonify({"status": "ok", "connected_datapaths": controller.get_datapath_ids()})
+
+    @app.route("/mitigation_history", methods=["GET"])
+    def get_mitigation_history():
+        """Every `/mitigate` call this process has handled — the dashboard's
+        (component 13) live classifications feed for the Phase B view.
+        """
+        return jsonify(mitigation_history)
+
+    @app.route("/switch_state", methods=["GET"])
+    def switch_state():
+        """Live flow table, meter counters, and port/link status for every connected switch.
+
+        Queried from the switches themselves on each request (see
+        `MitigationController.get_flow_table` and friends) -- the
+        dashboard's view of real flow-table state, not a record of what
+        the bridge believes it installed. A datapath that doesn't answer
+        in time reports `null` for that section.
+        """
+        state = {}
+        for dp_id in controller.get_datapath_ids():
+            state[str(dp_id)] = {
+                "flows": controller.get_flow_table(dp_id),
+                "meters": controller.get_meter_stats(dp_id),
+                "ports": controller.get_port_status(dp_id),
+            }
+        return jsonify(state)
 
     return app
 

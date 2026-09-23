@@ -105,10 +105,17 @@ def build_trust_filtered_strategy(
     benign_class: int,
     input_dim: int,
     min_clients: int,
+    live_state_path: str | None = None,
+    boosting_metrics: dict | None = None,
 ) -> TrustFilteredStrategy:
     """Build the Phase 4 trust-filtered strategy (component 7).
 
-    Args: same as `build_strategy`.
+    Args:
+        live_state_path: If given, forwarded to `TrustFilteredStrategy` so
+            the dashboard (component 13) can poll live per-round state.
+        boosting_metrics: If given, forwarded to `TrustFilteredStrategy`
+            (the broadcast boosting model's held-out metrics).
+        (remaining args: same as `build_strategy`.)
 
     Returns:
         A configured `TrustFilteredStrategy`.
@@ -118,6 +125,8 @@ def build_trust_filtered_strategy(
         boosting_model_bytes,
         num_classes,
         benign_class,
+        live_state_path=live_state_path,
+        boosting_metrics=boosting_metrics,
         fraction_fit=1.0,
         fraction_evaluate=1.0,
         min_fit_clients=min_clients,
@@ -179,15 +188,26 @@ if __name__ == "__main__":
         help="'custom_trust_filtered' uses component 7's TrustFilteredStrategy (Phase 4)",
     )
     parser.add_argument("--history-output", required=True)
+    parser.add_argument(
+        "--live-state-path", default=None,
+        help="Poll this path (custom_trust_filtered strategy only) with the dashboard for live per-round state",
+    )
+    parser.add_argument(
+        "--boosting-metrics-path", default=None,
+        help="JSON file of the boosting model's held-out metrics (fl_ids.eval.metrics.stage_report_summary), "
+        "recorded in the live state for the dashboard",
+    )
     args = parser.parse_args()
 
     setup_logging()
     run_config = load_config(args.config_path)
     model_bytes = Path(args.boosting_model_path).read_bytes()
+    boosting_metrics = json.loads(Path(args.boosting_metrics_path).read_text()) if args.boosting_metrics_path else None
 
     if args.strategy == "custom_trust_filtered":
         strategy = build_trust_filtered_strategy(
-            run_config, model_bytes, args.num_classes, args.benign_class, args.input_dim, args.min_clients
+            run_config, model_bytes, args.num_classes, args.benign_class, args.input_dim, args.min_clients,
+            live_state_path=args.live_state_path, boosting_metrics=boosting_metrics,
         )
     else:
         strategy = build_strategy(

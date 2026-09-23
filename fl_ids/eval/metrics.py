@@ -255,6 +255,25 @@ def evaluate_cascade(
     )
 
 
+def stage_report_summary(report: StageReport) -> dict:
+    """A JSON-serializable summary of a `StageReport`: headline metrics plus per-class F1/recall.
+
+    Used where a report has to travel through a file rather than stay in
+    memory -- e.g. the boosting model's held-out metrics that the Flower
+    server stamps into its live per-round state for the dashboard.
+    """
+    return {
+        "accuracy": report.accuracy,
+        "macro_f1": report.macro_f1,
+        "weighted_f1": report.weighted_f1,
+        "false_positive_rate": report.false_positive_rate,
+        "per_class": {
+            row["class"]: {"f1": float(row["f1"]), "recall": float(row["recall"]), "support": int(row["support"])}
+            for _, row in report.per_class.iterrows()
+        },
+    }
+
+
 def build_per_stage_table(reports: list[StageReport]) -> pd.DataFrame:
     """Flatten several `StageReport`s into one CSV-ready comparison table.
 

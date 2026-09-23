@@ -172,11 +172,15 @@ class AutoencoderClient(NumPyClient):
 
         if len(self.X_val_benign) == 0:
             logger.warning("Client %d: no benign validation samples to evaluate on", self.client_id)
-            return 0.0, 0, {"anomaly_threshold": float("inf")}
+            return 0.0, 0, {"anomaly_threshold": float("inf"), "client_id": self.client_id}
 
         errors = reconstruction_error(self.model, self.X_val_benign)
         threshold = compute_anomaly_threshold(errors, self.config.autoencoder.anomaly_percentile)
-        return float(np.mean(errors)), len(self.X_val_benign), {"anomaly_threshold": threshold}
+        return (
+            float(np.mean(errors)),
+            len(self.X_val_benign),
+            {"anomaly_threshold": threshold, "client_id": self.client_id},
+        )
 
 
 def make_client(
