@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 from fl_ids.utils.config import DataConfig
@@ -228,6 +229,22 @@ def partition_and_normalize_clients(
     per-client-normalize pipeline, just starting from different sources of
     (X, y).
 
+    **Both raw and per-client-normalized features are returned for the
+    train/test splits** (`"X"`/`"X_raw"`, `"X_test"`/`"X_test_raw"`) —
+    see `fl_ids.models.boosting`'s module docstring for why: the boosting
+    classifier (component 2) must always see raw features, never
+    per-client-normalized ones. Under real non-IID skew, a client's local
+    mean/std can differ from the population's by orders of magnitude
+    (e.g. a client that's 94% benign traffic ends up with per-feature
+    statistics dominated by benign traffic's characteristic value range),
+    which silently destroys a shared model's decision-tree thresholds if
+    it's ever evaluated against per-client-normalized input. Phase 5's
+    real-data validation caught this directly: the same held-out rows
+    scored ~0.94 accuracy in raw features vs. ~0.06 through a
+    heavily-skewed client's own scaler. `X_val_benign` doesn't need a raw
+    counterpart — component 3 never runs it through boosting, only
+    through the autoencoder, which does want normalized input.
+
     Args:
         X: Full feature matrix, shape (n_samples, n_features).
         y: Integer-encoded class labels, shape (n_samples,).
@@ -237,8 +254,8 @@ def partition_and_normalize_clients(
         seed: Global random seed, for reproducible partitioning/splitting.
 
     Returns:
-        `{client_id: {"X", "y", "X_val_benign", "y_val_benign", "X_test",
-        "y_test"}}`, all values `np.ndarray`.
+        `{client_id: {"X", "X_raw", "y", "X_val_benign", "y_val_benign",
+        "X_test", "X_test_raw", "y_test"}}`, all values `np.ndarray`.
     """
     client_index_map = dirichlet_partition(y, config.num_clients, config.dirichlet_alpha, seed)
 
@@ -262,24 +279,63 @@ def partition_and_normalize_clients(
                 client_id,
             )
 
-        X_train, X_val_benign, X_test = X[train_idx], X[val_benign_idx], X[test_idx]
+        X_train_raw, X_val_benign_raw, X_test_raw = X[train_idx], X[val_benign_idx], X[test_idx]
 
         if config.normalize_per_client and len(train_idx) > 0:
-            scaler = StandardScaler().fit(X_train)
-            X_train = scaler.transform(X_train)
-            X_val_benign = scaler.transform(X_val_benign) if len(val_benign_idx) else X_val_benign
-            X_test = scaler.transform(X_test) if len(test_idx) else X_test
+            scaler = StandardScaler().fit(X_train_raw)
+            X_train_norm = scaler.transform(X_train_raw)
+            X_val_benign_norm = scaler.transform(X_val_benign_raw) if len(val_benign_idx) else X_val_benign_raw
+            X_test_norm = scaler.transform(X_test_raw) if len(test_idx) else X_test_raw
+        else:
+            X_train_norm, X_val_benign_norm, X_test_norm = X_train_raw, X_val_benign_raw, X_test_raw
 
         client_data[client_id] = {
-            "X": X_train.astype(np.float32),
+            "X": X_train_norm.astype(np.float32),
+            "X_raw": X_train_raw.astype(np.float32),
             "y": y[train_idx],
-            "X_val_benign": X_val_benign.astype(np.float32),
+            "X_val_benign": X_val_benign_norm.astype(np.float32),
             "y_val_benign": y[val_benign_idx],
-            "X_test": X_test.astype(np.float32),
+            "X_test": X_test_norm.astype(np.float32),
+            "X_test_raw": X_test_raw.astype(np.float32),
             "y_test": y[test_idx],
         }
 
     return client_data
+
+
+def load_and_encode(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray, LabelEncoder, list[str], int]:
+    """Load, clean, and encode the raw CSV into a feature matrix and integer labels.
+
+    Shared by `build_federated_dataset` and
+    `build_server_and_federated_dataset` — both need the identical
+    load/clean/encode steps, just splitting the resulting (X, y)
+    differently afterward.
+
+    Args:
+        csv_path: Path to `DNN-EdgeIIoT-dataset.csv`.
+
+    Returns:
+        (X, y, label_encoder, feature_names, benign_class).
+
+    Raises:
+        AssertionError: If NaNs remain in the feature matrix after cleaning
+            (would indicate a bug in `clean_dataframe`).
+    """
+    df = load_raw_csv(csv_path)
+    df = clean_dataframe(df)
+    df = one_hot_encode_categoricals(df)
+
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(df[TARGET_COLUMN].values)
+    benign_class = int(label_encoder.transform([BENIGN_LABEL])[0])
+
+    feature_df = df.drop(columns=[TARGET_COLUMN])
+    feature_names = feature_df.columns.tolist()
+    X = feature_df.to_numpy(dtype=np.float32)
+
+    assert not np.isnan(X).any(), "NaNs present in feature matrix after cleaning"
+
+    return X, y, label_encoder, feature_names, benign_class
 
 
 def build_federated_dataset(
@@ -302,24 +358,49 @@ def build_federated_dataset(
         - The fitted `LabelEncoder` mapping `Attack_type` strings to the
           integer classes used in `y`.
         - The list of feature column names, in `X` column order.
-
-    Raises:
-        AssertionError: If NaNs remain in the feature matrix after cleaning
-            (would indicate a bug in `clean_dataframe`).
     """
-    df = load_raw_csv(csv_path)
-    df = clean_dataframe(df)
-    df = one_hot_encode_categoricals(df)
-
-    label_encoder = LabelEncoder()
-    y = label_encoder.fit_transform(df[TARGET_COLUMN].values)
-    benign_class = int(label_encoder.transform([BENIGN_LABEL])[0])
-
-    feature_df = df.drop(columns=[TARGET_COLUMN])
-    feature_names = feature_df.columns.tolist()
-    X = feature_df.to_numpy(dtype=np.float32)
-
-    assert not np.isnan(X).any(), "NaNs present in feature matrix after cleaning"
-
+    X, y, label_encoder, feature_names, benign_class = load_and_encode(csv_path)
     client_data = partition_and_normalize_clients(X, y, benign_class, config, seed)
     return client_data, label_encoder, feature_names
+
+
+def build_server_and_federated_dataset(
+    csv_path: str | Path,
+    config: DataConfig,
+    calibration_fraction: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, dict[int, dict[str, np.ndarray]], LabelEncoder, list[str]]:
+    """Build a server-held calibration set plus the per-client federated dataset.
+
+    Per component 2's label-source design decision (see
+    `fl_ids.models.boosting`'s module docstring), the boosting classifier's
+    training labels come from a small, independently server-held
+    calibration set — never from client data. That means this calibration
+    slice must be carved out of the full dataset *before* client
+    partitioning and kept disjoint from every client's data, not
+    reconstructed after the fact from what clients happen to hold.
+
+    Args:
+        csv_path: Path to `DNN-EdgeIIoT-dataset.csv`.
+        config: Data configuration (num_clients, dirichlet_alpha, split
+            fractions, normalize_per_client) — applied to the *remainder*
+            after the calibration slice is removed.
+        calibration_fraction: Fraction of the full cleaned dataset held out
+            server-side (stratified by class), matching
+            `BoostingConfig.calibration_fraction`.
+        seed: Global random seed, for reproducible splitting/partitioning.
+
+    Returns:
+        (X_calibration, y_calibration, client_data, label_encoder, feature_names).
+        `X_calibration` is raw-scale (not normalized) — the caller
+        standardizes it however the boosting model expects (see
+        `fl_ids.models.boosting`'s feature-scale design decision).
+    """
+    X, y, label_encoder, feature_names, benign_class = load_and_encode(csv_path)
+
+    X_calib, X_pool, y_calib, y_pool = train_test_split(
+        X, y, train_size=calibration_fraction, random_state=seed, stratify=y
+    )
+
+    client_data = partition_and_normalize_clients(X_pool, y_pool, benign_class, config, seed)
+    return X_calib, y_calib, client_data, label_encoder, feature_names

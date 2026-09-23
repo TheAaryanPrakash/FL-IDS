@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-CLIENT_DATA_KEYS = ("X", "y", "X_val_benign", "y_val_benign", "X_test", "y_test")
+CLIENT_DATA_KEYS = ("X", "X_raw", "y", "X_val_benign", "y_val_benign", "X_test", "X_test_raw", "y_test")
 
 
 def save_client_data(path: str | Path, data: dict[str, np.ndarray]) -> None:

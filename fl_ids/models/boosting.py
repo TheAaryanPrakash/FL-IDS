@@ -23,20 +23,29 @@ would mean the autoencoder trains on effectively unfiltered garbage.
 aggregated via Flower's weight-averaging), so it must be serializable to
 bytes and reconstructable client-side — see `to_bytes`/`from_bytes`.
 
-**Design decision — feature scale:** component 1 normalizes features
-per-client (never globally — see `fl_ids.data.pipeline`), so there is no
-single shared scaler this server-side model could use that would also
-match every client's local scale. Instead, this model is trained on its
-own server-held calibration set *standardized the same way* (a scaler
-fit on the calibration set itself) — every client independently
-standardizes its own local data to roughly the same per-feature shape
-(mean 0, std 1), so the model's learned split thresholds stay meaningful
-in that shared "standardized units" space even though no two clients (or
-the server) use the literal same scaler. This is not a rigorous
-cross-client alignment (each client's raw-to-standardized mapping still
-differs), but tree splits only need per-feature values to be in a
-comparable range, not identically scaled — a documented, deliberate
-approximation, not a silent gap.
+**Design decision — feature scale: this model always trains and predicts
+on RAW (unnormalized) features, never per-client-normalized ones.**
+Component 1 normalizes per-client (never globally — see
+`fl_ids.data.pipeline`), which is correct for the autoencoder (a neural
+net that benefits from normalized input) but wrong for this model: a
+tree-based classifier doesn't need normalization at all (per-feature
+decision splits are invariant to monotonic scaling), and applying a
+*different* per-client scaler to input from a shared, centrally-trained
+model actively breaks it. An earlier version of this module tried
+training the boosting model on a calibration set standardized to
+"roughly the same shape" every client's own scaler would also produce,
+reasoning that tree splits only need comparable ranges, not identical
+scaling — Phase 5's real-data validation showed this reasoning was wrong
+in practice: under real non-IID skew, a client whose local shard is
+e.g. 94% benign traffic ends up with per-feature statistics dominated by
+benign traffic's characteristic value range, nowhere close to the
+calibration set's population-level statistics. The same held-out rows
+scored ~0.94 accuracy in raw features vs. ~0.06 through that client's own
+scaler — not a minor approximation error, a broken model. `X_raw` /
+`X_test_raw` (see `fl_ids.data.pipeline.partition_and_normalize_clients`)
+exist specifically so this model — both server-side training and
+client-side inference via `passes_to_autoencoder` — always sees the same
+raw-scale feature representation everywhere.
 """
 
 from __future__ import annotations
@@ -120,6 +129,18 @@ class BoostingClassifier:
             "num_leaves": self.config.num_leaves,
             "seed": self.seed,
             "verbosity": -1,
+            # LightGBM's default multi-threaded histogram building is NOT
+            # bit-reproducible across runs even with a fixed seed (parallel
+            # reduction order varies with OS thread scheduling) -- this
+            # combination is LightGBM's own documented recipe for genuine
+            # run-to-run determinism. Discovered in Phase 5: without these,
+            # the exact same call produced wildly different real-data
+            # per-class recall from run to run (e.g. one minority class's
+            # recall swung between 0.0 and 0.88 on identical inputs/seed),
+            # violating CLAUDE.md's "fixed seeds everywhere" requirement.
+            "deterministic": True,
+            "force_row_wise": True,
+            "num_threads": 1,
         }
         logger.info(
             "Training boosting classifier: %d samples, %d classes, %d rounds",

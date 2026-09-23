@@ -22,6 +22,7 @@ from fl_ids.data.pipeline import (
     DEFAULT_DROP_COLUMNS,
     TARGET_COLUMN,
     build_federated_dataset,
+    build_server_and_federated_dataset,
     clean_dataframe,
     dirichlet_partition,
     load_raw_csv,
@@ -280,3 +281,50 @@ def test_build_federated_dataset_real_data():
 
     tvd = _pairwise_total_variation(np.array(label_dists))
     assert tvd > 0.05, "real-data client split should show a real non-IID label skew"
+
+
+@pytest.mark.skipif(not REAL_DATASET_PATH.exists(), reason="real dataset not present")
+def test_build_server_and_federated_dataset_calibration_disjoint_from_clients():
+    """Phase 5: the server-held calibration set (component 2's label
+    source) must be carved out before client partitioning and stay
+    disjoint from every client's data — not reconstructed after the
+    fact from data clients already hold.
+
+    Client data is per-client *normalized* while the calibration set is
+    raw-scale, so a direct row-value comparison between the two would be
+    meaningless (identical underlying rows look numerically different
+    after different scalers). Instead this checks: (a) the calibration
+    split is exactly reproducible from the same (X, y, seed) via a
+    fresh, independent `train_test_split` call — proving disjointness by
+    construction, backed by sklearn's own tested guarantee that
+    `train_test_split` returns non-overlapping index partitions — and
+    (b) row counts are conserved (no rows lost or double-counted between
+    the calibration set and the client pool).
+    """
+    from sklearn.model_selection import train_test_split
+
+    from fl_ids.data.pipeline import load_and_encode
+
+    config = _base_data_config(num_clients=5, dirichlet_alpha=0.3)
+    X_calib, y_calib, client_data, label_encoder, feature_names = build_server_and_federated_dataset(
+        REAL_DATASET_PATH, config, calibration_fraction=0.05, seed=42
+    )
+
+    assert X_calib.shape[0] > 0
+    assert X_calib.shape[1] == len(feature_names)
+    assert not np.isnan(X_calib).any()
+
+    X_full, y_full, _, _, _ = load_and_encode(REAL_DATASET_PATH)
+    expected_X_calib, expected_X_pool, expected_y_calib, _ = train_test_split(
+        X_full, y_full, train_size=0.05, random_state=42, stratify=y_full
+    )
+    assert np.array_equal(X_calib, expected_X_calib)
+    assert np.array_equal(y_calib, expected_y_calib)
+
+    total_client_rows = sum(
+        data["X"].shape[0] + data["X_val_benign"].shape[0] + data["X_test"].shape[0]
+        for data in client_data.values()
+    )
+    assert total_client_rows == expected_X_pool.shape[0]
+    # Calibration set (~5%) should be much smaller than what's left for clients.
+    assert X_calib.shape[0] < total_client_rows * 0.1

@@ -20,9 +20,17 @@ boosting:
   label_source: "server_held_calibration_set"  # or "client_local_labels"
   calibration_fraction: 0.05  # fraction of data held server-side for cold-start bootstrap
   confidence_threshold: 0.7  # cascade decision rule: below this, fall through to autoencoder
-  num_boost_round: 200
-  learning_rate: 0.05
-  num_leaves: 31
+  # num_boost_round/learning_rate/num_leaves re-tuned in Phase 5 against
+  # real Edge-IIoTset data (original synthetic-tuned defaults were
+  # 200/0.05/31). With 95 real features of very uneven importance (e.g.
+  # tcp.checksum's gain dwarfs icmp.checksum's), num_leaves=31 didn't give
+  # LightGBM enough per-round tree capacity to reliably carve out a split
+  # for every class once deterministic training was fixed (see
+  # fl_ids.models.boosting's train() comment) -- num_leaves=127 recovered
+  # real signal for every class down to a few hundred real-world examples.
+  num_boost_round: 300
+  learning_rate: 0.1
+  num_leaves: 127
   broadcast_every_n_rounds: 1
   update_every_n_rounds: 3  # incremental update cadence using aggregated histograms
 

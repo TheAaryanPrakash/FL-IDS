@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import numpy as np
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 from fl_ids.data.synthetic import make_synthetic_attack_dataset
 from fl_ids.fl.client import AutoencoderClient
@@ -86,10 +87,13 @@ def _autoencoder_config(**overrides) -> AutoencoderConfig:
 
 def _make_client_and_boosting_model(seed: int = 10):
     X, y, class_names = make_synthetic_attack_dataset(n_samples=3000, n_features=12, seed=seed)
-    X_train, X_client, y_train, y_client = train_test_split(
+    X_train, X_client_raw, y_train, y_client = train_test_split(
         X, y, test_size=0.3, random_state=seed, stratify=y
     )
 
+    # Boosting always trains/predicts on raw features (see
+    # fl_ids.models.boosting's module docstring for why per-client
+    # normalization must never reach it).
     boosting_config = _boosting_config(confidence_threshold=0.6)
     boosting_model = BoostingClassifier(boosting_config, len(class_names), BENIGN_CLASS, seed=seed)
     boosting_model.train(X_train, y_train)
@@ -97,10 +101,18 @@ def _make_client_and_boosting_model(seed: int = 10):
     autoencoder_config = _autoencoder_config()
     config = _full_config(boosting_config, autoencoder_config)
 
-    val_benign = X_client[y_client == BENIGN_CLASS][:50]
+    # The autoencoder trains on a *different* (normalized) representation
+    # of the same rows -- mirrors component 1's per-client scaler, fit
+    # only on this client's own data.
+    client_scaler = StandardScaler().fit(X_client_raw)
+    X_client_norm = client_scaler.transform(X_client_raw).astype(np.float32)
+
+    val_benign_raw = X_client_raw[y_client == BENIGN_CLASS][:50]
+    val_benign = client_scaler.transform(val_benign_raw).astype(np.float32)
     client = AutoencoderClient(
         client_id=0,
-        X_train_raw=X_client,
+        X_train=X_client_norm,
+        X_train_raw=X_client_raw,
         X_val_benign=val_benign,
         config=config,
         input_dim=X.shape[1],
@@ -124,8 +136,10 @@ def test_fit_trains_autoencoder_only_on_boosting_filtered_subset():
     client, boosting_model, config = _make_client_and_boosting_model()
     fit_config = _fit_config(boosting_model, boosting_model.num_classes)
 
+    # The filter mask is computed on raw features, but the autoencoder
+    # must train on the *normalized* counterpart of exactly those rows.
     expected_mask = boosting_model.passes_to_autoencoder(client.X_train_raw)
-    expected_X_filtered = client.X_train_raw[expected_mask]
+    expected_X_filtered = client.X_train[expected_mask]
 
     # Sanity: the filter must actually exclude *something*, or this test
     # would pass vacuously even if fit() ignored filtering entirely.

@@ -41,13 +41,18 @@ class AutoencoderClient(NumPyClient):
 
     Filters local traffic through the global boosting model (cascade
     stage 1) before training the local autoencoder on the resulting
-    "normal" subset — never on raw, unfiltered local traffic (component
-    3's requirement).
+    "normal" subset — never on unfiltered local traffic (component 3's
+    requirement). The boosting filter itself runs on *raw* features
+    (`X_train_raw`) — see `fl_ids.models.boosting`'s module docstring for
+    why per-client-normalized input silently breaks a shared tree model —
+    while the autoencoder trains on the *normalized* counterpart
+    (`X_train`) of exactly the rows the filter passed.
     """
 
     def __init__(
         self,
         client_id: int,
+        X_train: np.ndarray,
         X_train_raw: np.ndarray,
         X_val_benign: np.ndarray,
         config: Config,
@@ -57,15 +62,20 @@ class AutoencoderClient(NumPyClient):
 
         Args:
             client_id: This client's identifier (used only for logging).
-            X_train_raw: This client's full local training features
-                (component 1's per-client "X" — already per-client
-                normalized, unfiltered by boosting).
-            X_val_benign: This client's held-out benign validation slice,
-                for recomputing the anomaly threshold each round.
+            X_train: This client's full local training features,
+                per-client normalized (component 1's "X") — what the
+                autoencoder actually trains on, after boosting filtering.
+            X_train_raw: The same rows as `X_train`, in raw (unnormalized)
+                scale (component 1's "X_raw") — what the boosting filter
+                runs on.
+            X_val_benign: This client's held-out benign validation slice
+                (normalized), for recomputing the anomaly threshold each
+                round.
             config: Full project config.
             input_dim: Number of input features (autoencoder input width).
         """
         self.client_id = client_id
+        self.X_train = X_train
         self.X_train_raw = X_train_raw
         self.X_val_benign = X_val_benign
         self.config = config
@@ -106,7 +116,7 @@ class AutoencoderClient(NumPyClient):
         )
 
         mask = boosting_model.passes_to_autoencoder(self.X_train_raw)
-        X_filtered = self.X_train_raw[mask]
+        X_filtered = self.X_train[mask]
         self.last_filtered_fraction = float(mask.mean()) if len(mask) else 0.0
 
         if len(X_filtered) > 0:
@@ -161,7 +171,14 @@ def make_client(
     client_id: int, client_data: dict[str, np.ndarray], config: Config, input_dim: int
 ) -> AutoencoderClient:
     """Construct an `AutoencoderClient` from a component-1-shaped client data dict."""
-    return AutoencoderClient(client_id, client_data["X"], client_data["X_val_benign"], config, input_dim)
+    return AutoencoderClient(
+        client_id,
+        client_data["X"],
+        client_data["X_raw"],
+        client_data["X_val_benign"],
+        config,
+        input_dim,
+    )
 
 
 if __name__ == "__main__":
@@ -200,6 +217,7 @@ if __name__ == "__main__":
         client = SignFlipAttackerClient(
             args.client_id,
             data["X"],
+            data["X_raw"],
             data["X_val_benign"],
             run_config,
             input_dim,
