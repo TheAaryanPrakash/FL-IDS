@@ -24,6 +24,15 @@ flwr==1.38.0
 flask==3.1.3
 requests==2.34.2
 
+# SDN controller (component 10) — os-ken, the actively-maintained
+# OpenStack fork of Ryu, created specifically because upstream Ryu went
+# unmaintained (matching the exact reason CLAUDE.md says not to default
+# to Ryu). Verified working in this environment: real HELLO/FEATURES
+# handshake with Open vSwitch and FLOW_MOD installation confirmed via
+# `ovs-ofctl dump-flows`, not just imports cleanly.
+os-ken==4.2.2
+eventlet==0.41.2
+
 # Raw traffic handling for Phase B (.pcap replay support tooling)
 scapy==2.7.0
 
