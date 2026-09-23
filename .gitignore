@@ -25,6 +25,7 @@ data/processed/
 *.csv
 *.pcap
 *.pcapng
+*.zip
 !fl_ids/data/**/*.py
 
 # Model checkpoints / artifacts
