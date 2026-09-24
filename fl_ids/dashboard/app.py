@@ -52,7 +52,7 @@ from fl_ids.dashboard.data import (
 st.set_page_config(page_title="FL-IDS Dashboard", layout="wide")
 st.title("FL-IDS Live Monitoring Dashboard")
 
-view = st.sidebar.radio("View", ["Training (Phase A)", "Live Simulation (Phase B)"])
+view = st.sidebar.radio("View", ["Training (Phase A)", "Live Simulation (Phase B)"], key="view")
 
 
 def _render_boosting_section(round_history: list[dict]) -> None:
@@ -87,7 +87,7 @@ def _render_boosting_section(round_history: list[dict]) -> None:
 
 def _render_training_view() -> None:
     st.header("Phase A: Federated Training")
-    state_path_str = st.sidebar.text_input("Live state file", value="/tmp/fl_ids_training_state.json")
+    state_path_str = st.sidebar.text_input("Live state file", value="/tmp/fl_ids_training_state.json", key="training_state_path")
     auto_refresh = st.sidebar.checkbox("Auto-refresh (5s)", value=True, key="training_auto_refresh")
 
     path = Path(state_path_str)
@@ -167,7 +167,7 @@ def _topology_dot(switch_states: dict, devices: dict, mitigations_by_ip: dict[st
 
 def _render_live_simulation_view() -> None:
     st.header("Phase B: Live SDN Mitigation Simulation")
-    bridge_url = st.sidebar.text_input("SDN bridge URL", value="http://127.0.0.1:8080")
+    bridge_url = st.sidebar.text_input("SDN bridge URL", value="http://127.0.0.1:8080", key="bridge_url")
     auto_refresh = st.sidebar.checkbox("Auto-refresh (3s)", value=True, key="simulation_auto_refresh")
 
     try:
