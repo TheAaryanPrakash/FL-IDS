@@ -267,6 +267,10 @@ if __name__ == "__main__":
         help="'sign_flip' runs the component 5 test attacker (fl_ids.robustness.attackers)",
     )
     parser.add_argument("--amplification", type=float, default=5.0, help="sign_flip attacker's delta amplification")
+    parser.add_argument(
+        "--claimed-examples", type=int, default=None,
+        help="sign_flip attacker: example count to report instead of the true one (FedAvg weight inflation)",
+    )
     args = parser.parse_args()
 
     setup_logging()
@@ -285,6 +289,7 @@ if __name__ == "__main__":
             run_config,
             input_dim,
             amplification=args.amplification,
+            claimed_num_examples=args.claimed_examples,
             y_train=data["y"],
         )
     else:

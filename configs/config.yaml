@@ -77,6 +77,11 @@ robustness:
   norm_clip_multiplier: 2.0  # reject/clip updates beyond this multiple of median norm
   mad_outlier_threshold: 3.0  # median absolute deviation multiplier for cosine outlier flag
   trust_ema_alpha: 0.3  # weight on new round's score vs. running trust history
+  # Example count the sign-flip test attacker reports: "honest" or
+  # "max_client" (claims the largest client's count, inflating its FedAvg
+  # weight the way attackers in the literature do; the trust filter and
+  # trimmed mean ignore reported counts).
+  attacker_example_count: "max_client"
 
 sdn:
   block_confidence_threshold: 0.85

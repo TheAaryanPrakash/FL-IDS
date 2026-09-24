@@ -90,6 +90,11 @@ class RobustnessConfig:
     norm_clip_multiplier: float
     mad_outlier_threshold: float
     trust_ema_alpha: float
+    # What sign-flip test attackers report as their example count:
+    # "honest" (their true count) or "max_client" (the largest client's
+    # count -- inflating their weight under plain FedAvg, as attackers in
+    # the literature do). See fl_ids.robustness.attackers.
+    attacker_example_count: str = "max_client"
 
 
 @dataclass

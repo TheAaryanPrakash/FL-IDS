@@ -28,7 +28,7 @@ from fl_ids.models.autoencoder import Autoencoder, get_weights, set_weights
 from fl_ids.models.boosting import BoostingClassifier
 from fl_ids.models.boosting_update import SURFACE_ALERTS_KEY, BoostingUpdater, BoostingUpdateRecord, decode_alerts
 from fl_ids.robustness.aggregation import apply_delta, trimmed_mean_delta
-from fl_ids.robustness.attackers import SignFlipAttackerClient
+from fl_ids.robustness.attackers import SignFlipAttackerClient, attacker_claimed_examples
 from fl_ids.robustness.trust_filter import TrustTracker, compute_delta, filter_client_deltas, flatten_weights
 from fl_ids.utils.config import Config
 
@@ -99,11 +99,14 @@ def _make_clients(
     amplification: float,
 ) -> dict[int, AutoencoderClient]:
     clients = {}
+    claimed = attacker_claimed_examples(config.robustness, [len(d["X"]) for d in client_data.values()])
     for cid, data in client_data.items():
         args = (cid, data["X"], data["X_raw"], data["X_val_benign"], config, input_dim)
         kwargs = {"use_boosting_filter": use_boosting_filter, "y_train": data["y"]}
         if cid in malicious_client_ids:
-            clients[cid] = SignFlipAttackerClient(*args, amplification=amplification, **kwargs)
+            clients[cid] = SignFlipAttackerClient(
+                *args, amplification=amplification, claimed_num_examples=claimed, **kwargs
+            )
         else:
             clients[cid] = AutoencoderClient(*args, **kwargs)
     return clients

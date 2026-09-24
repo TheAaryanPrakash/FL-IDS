@@ -45,6 +45,7 @@ from fl_ids.fl.launch import wait_for_server
 from fl_ids.models.autoencoder import Autoencoder, compute_anomaly_threshold, reconstruction_error, set_weights
 from fl_ids.models.boosting import BoostingClassifier
 from fl_ids.orchestration.artifacts import save_phase_a_artifacts
+from fl_ids.robustness.attackers import attacker_claimed_examples
 from fl_ids.utils.config import Config, write_config_yaml
 
 logger = logging.getLogger(__name__)
@@ -197,21 +198,25 @@ def run_federated_training(
         log_files.append(log_file)
         processes.append((name, subprocess.Popen(cmd, cwd=REPO_ROOT, stdout=log_file, stderr=subprocess.STDOUT)))
 
+    claimed = attacker_claimed_examples(config.robustness, [len(d["X"]) for d in prepared.client_data.values()])
     try:
         _launch("server", server_cmd)
         wait_for_server(config.orchestration.server_address, processes[0][1])
         for cid, data in prepared.client_data.items():
             data_path = run_dir / f"client_{cid}.npz"
             save_client_data(data_path, data)
-            client_type = "sign_flip" if cid in malicious_client_ids else "honest"
-            _launch(f"client_{cid}", [
+            client_cmd = [
                 sys.executable, "-m", "fl_ids.fl.client",
                 "--client-id", str(cid),
                 "--server-address", config.orchestration.server_address,
                 "--data-path", str(data_path),
                 "--config-path", str(config_path),
-                "--client-type", client_type,
-            ])
+            ]
+            if cid in malicious_client_ids:
+                client_cmd += ["--client-type", "sign_flip"]
+                if claimed is not None:
+                    client_cmd += ["--claimed-examples", str(claimed)]
+            _launch(f"client_{cid}", client_cmd)
         logger.info(
             "Started Flower server on %s and %d clients (%d sign-flip attackers) for %d rounds; logs in %s",
             config.orchestration.server_address, len(prepared.client_data), len(malicious_client_ids),
