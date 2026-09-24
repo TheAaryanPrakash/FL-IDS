@@ -23,6 +23,7 @@ from sklearn.model_selection import train_test_split
 from fl_ids.data.pipeline import partition_and_normalize_clients
 from fl_ids.data.synthetic import make_synthetic_attack_dataset
 from fl_ids.fl.data_io import save_client_data
+from fl_ids.fl.launch import wait_for_server
 from fl_ids.models.boosting import BoostingClassifier
 from fl_ids.utils.config import BoostingConfig, DataConfig
 
@@ -177,6 +178,7 @@ def test_real_multiprocess_fl_run_completes_and_reduces_reconstruction_error(fl_
     server_proc = subprocess.Popen(
         server_cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
+    wait_for_server(server_address, server_proc)
 
     client_procs = []
     try:

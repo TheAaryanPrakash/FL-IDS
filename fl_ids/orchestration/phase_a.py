@@ -41,6 +41,7 @@ from fl_ids.data.pipeline import load_and_encode, partition_and_normalize_client
 from fl_ids.eval.common import concat_client_test_slices, per_row_thresholds, select_malicious_clients
 from fl_ids.eval.metrics import detection_metrics, evaluate_boosting_alone, flag_attacks, stage_report_summary
 from fl_ids.fl.data_io import save_client_data
+from fl_ids.fl.launch import wait_for_server
 from fl_ids.models.autoencoder import Autoencoder, compute_anomaly_threshold, reconstruction_error, set_weights
 from fl_ids.models.boosting import BoostingClassifier
 from fl_ids.orchestration.artifacts import save_phase_a_artifacts
@@ -198,6 +199,7 @@ def run_federated_training(
 
     try:
         _launch("server", server_cmd)
+        wait_for_server(config.orchestration.server_address, processes[0][1])
         for cid, data in prepared.client_data.items():
             data_path = run_dir / f"client_{cid}.npz"
             save_client_data(data_path, data)

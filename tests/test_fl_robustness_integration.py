@@ -25,6 +25,7 @@ from sklearn.model_selection import train_test_split
 from fl_ids.data.pipeline import partition_and_normalize_clients
 from fl_ids.data.synthetic import make_synthetic_attack_dataset
 from fl_ids.fl.data_io import save_client_data
+from fl_ids.fl.launch import wait_for_server
 from fl_ids.models.boosting import BoostingClassifier
 from fl_ids.utils.config import BoostingConfig, DataConfig
 
@@ -194,6 +195,7 @@ def test_real_multiprocess_run_separates_honest_and_attacker_trust(robustness_ru
     server_proc = subprocess.Popen(
         server_cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
+    wait_for_server(server_address, server_proc)
 
     client_procs = []
     try:
@@ -220,7 +222,15 @@ def test_real_multiprocess_run_separates_honest_and_attacker_trust(robustness_ru
         except subprocess.TimeoutExpired:
             server_proc.kill()
             server_out, _ = server_proc.communicate()
-            pytest.fail(f"Server process did not finish in time. Output:\n{server_out}")
+            # A hung server is usually waiting on a client, so show theirs too.
+            client_outputs = []
+            for i, proc in enumerate(client_procs):
+                proc.kill()
+                out, _ = proc.communicate()
+                client_outputs.append(f"--- client {i} (exit {proc.returncode}) ---\n{out[-3000:]}")
+            pytest.fail(
+                f"Server process did not finish in time. Output:\n{server_out}\n" + "\n".join(client_outputs)
+            )
 
         assert server_proc.returncode == 0, f"Server process failed. Output:\n{server_out}"
 

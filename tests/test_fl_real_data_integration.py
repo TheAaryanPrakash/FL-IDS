@@ -26,6 +26,7 @@ from sklearn.model_selection import train_test_split
 
 from fl_ids.data.pipeline import load_and_encode, partition_and_normalize_clients
 from fl_ids.fl.data_io import save_client_data
+from fl_ids.fl.launch import wait_for_server
 from fl_ids.utils.config import DataConfig
 from tests.real_data_boosting import (
     assert_boosting_filter_is_real,
@@ -184,6 +185,7 @@ def test_real_multiprocess_fl_run_on_real_data_reduces_reconstruction_error(real
     server_proc = subprocess.Popen(
         server_cmd, cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
     )
+    wait_for_server(server_address, server_proc)
 
     client_procs = []
     try:
