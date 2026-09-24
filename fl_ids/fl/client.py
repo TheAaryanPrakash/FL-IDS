@@ -5,8 +5,12 @@ Wraps the client-side autoencoder (component 3) in `flwr.client.NumPyClient`.
 strategy's per-round fit config, component 2) locally to filter local
 traffic down to the "normal" subset per the shared cascade rule, trains
 the autoencoder on exactly that subset, and returns updated weights plus
-a fixed-bin reconstruction-error histogram (not raw traffic) for later
-boosting-refinement use.
+a fixed-bin reconstruction-error histogram (not raw traffic). On the
+server's update rounds it also surfaces a capped number of alerts —
+traffic boosting passed that the global autoencoder flags, with their
+analyst-confirmed labels — for the incremental boosting update
+(`fl_ids.models.boosting_update`), the one case where feature rows leave
+the client.
 
 Runnable both as a real separate process (this module's `__main__`, using
 `flwr.client.start_client`) and instantiated directly for testing
@@ -31,6 +35,7 @@ from fl_ids.models.autoencoder import (
     train_autoencoder,
 )
 from fl_ids.models.boosting import BoostingClassifier
+from fl_ids.models.boosting_update import SURFACE_ALERTS_KEY, SurfacedAlerts, encode_alerts, select_alerts
 from fl_ids.utils.config import Config
 
 logger = logging.getLogger(__name__)
@@ -58,6 +63,7 @@ class AutoencoderClient(NumPyClient):
         config: Config,
         input_dim: int,
         use_boosting_filter: bool = True,
+        y_train: np.ndarray | None = None,
     ) -> None:
         """Initialize the client.
 
@@ -80,6 +86,10 @@ class AutoencoderClient(NumPyClient):
                 False exists only to support the "autoencoder-only (no
                 boosting pre-filter)" ablation row (component 12) — never
                 the default for real training.
+            y_train: Labels for `X_train`'s rows — the label an analyst
+                would confirm for a surfaced alert (see
+                `fl_ids.models.boosting_update`). Without it the client
+                can't surface alerts, and ignores requests to.
         """
         self.client_id = client_id
         self.X_train = X_train
@@ -87,6 +97,7 @@ class AutoencoderClient(NumPyClient):
         self.X_val_benign = X_val_benign
         self.config = config
         self.use_boosting_filter = use_boosting_filter
+        self.y_train = y_train
         self.model = Autoencoder(
             input_dim, config.autoencoder.hidden_dims, config.autoencoder.bottleneck_dim
         )
@@ -131,6 +142,13 @@ class AutoencoderClient(NumPyClient):
         X_filtered = self.X_train[mask]
         self.last_filtered_fraction = float(mask.mean()) if len(mask) else 0.0
 
+        # Alerts are raised by the model deployed this round -- the global
+        # weights just received -- so score before local training changes them.
+        alert_metrics: dict[str, Scalar] = {}
+        if config.get(SURFACE_ALERTS_KEY):
+            alerts = self._surface_alerts(mask, int(config.get("server_round", 0)))
+            alert_metrics = encode_alerts(alerts)
+
         if len(X_filtered) > 0:
             train_autoencoder(self.model, X_filtered, self.config.autoencoder, seed=self.config.seed)
             errors = reconstruction_error(self.model, X_filtered)
@@ -152,8 +170,36 @@ class AutoencoderClient(NumPyClient):
             "reconstruction_error_histogram": hist.tobytes(),
             "filtered_fraction": self.last_filtered_fraction,
             "client_id": self.client_id,
+            **alert_metrics,
         }
         return get_weights(self.model), len(X_filtered), metrics
+
+    def _surface_alerts(self, passed_mask: np.ndarray, server_round: int) -> SurfacedAlerts:
+        """Rows boosting passed that the current global autoencoder flags, capped and labeled.
+
+        Uses this client's own threshold (computed on its benign validation
+        slice with the same global weights), as its detector would in
+        deployment. Returns nothing without labels or benign validation data.
+        """
+        n_features = self.X_train_raw.shape[1]
+        empty = SurfacedAlerts(np.empty((0, n_features), dtype=np.float32), np.empty(0, dtype=np.int64))
+        if self.y_train is None or len(self.X_val_benign) == 0 or not passed_mask.any():
+            if self.y_train is None:
+                logger.warning("Client %d: asked to surface alerts but has no labels to confirm them", self.client_id)
+            return empty
+        threshold = compute_anomaly_threshold(
+            reconstruction_error(self.model, self.X_val_benign), self.config.autoencoder.anomaly_percentile
+        )
+        errors = reconstruction_error(self.model, self.X_train[passed_mask])
+        alerts = select_alerts(
+            errors, threshold, self.X_train_raw[passed_mask], self.y_train[passed_mask],
+            self.config.boosting.alert_budget_per_client, seed=self.config.seed + 1000 * server_round + self.client_id,
+        )
+        logger.info(
+            "Client %d round %d: %d of %d boosting-passed rows flagged; surfacing %d",
+            self.client_id, server_round, int((errors > threshold).sum()), len(errors), len(alerts),
+        )
+        return alerts
 
     def evaluate(
         self, parameters: NDArrays, config: dict[str, Scalar]
@@ -194,6 +240,7 @@ def make_client(
         client_data["X_val_benign"],
         config,
         input_dim,
+        y_train=client_data["y"],
     )
 
 
@@ -238,6 +285,7 @@ if __name__ == "__main__":
             run_config,
             input_dim,
             amplification=args.amplification,
+            y_train=data["y"],
         )
     else:
         client = make_client(args.client_id, data, run_config, input_dim)

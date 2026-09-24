@@ -135,15 +135,9 @@ class BoostingClassifier:
         """Whether `train` or `from_bytes` has populated an underlying model."""
         return self._booster is not None
 
-    def train(self, X: np.ndarray, y: np.ndarray) -> None:
-        """Train (or retrain) on labeled attack-type data.
-
-        Args:
-            X: Feature matrix, shape (n_samples, n_features).
-            y: Integer-encoded attack-type labels, shape (n_samples,).
-        """
-        train_set = lgb.Dataset(X, label=y)
-        params = {
+    def _train_params(self) -> dict:
+        """LightGBM parameters shared by `train` and `continue_training`."""
+        return {
             "objective": "multiclass",
             "num_class": self.num_classes,
             "learning_rate": self.config.learning_rate,
@@ -174,6 +168,16 @@ class BoostingClassifier:
             "force_row_wise": True,
             "num_threads": 1,
         }
+
+    def train(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Train (or retrain) on labeled attack-type data.
+
+        Args:
+            X: Feature matrix, shape (n_samples, n_features).
+            y: Integer-encoded attack-type labels, shape (n_samples,).
+        """
+        train_set = lgb.Dataset(X, label=y)
+        params = self._train_params()
         logger.info(
             "Training boosting classifier: %d samples, %d classes, %d rounds",
             len(y),
@@ -181,6 +185,43 @@ class BoostingClassifier:
             self.config.num_boost_round,
         )
         self._booster = lgb.train(params, train_set, num_boost_round=self.config.num_boost_round)
+
+    def continue_training(self, X: np.ndarray, y: np.ndarray, num_boost_round: int) -> "BoostingClassifier":
+        """Return a new classifier: this one plus `num_boost_round` more trees fitted on (X, y).
+
+        LightGBM's `init_model` continued training — the existing trees are
+        kept and new ones fit the remaining error on the given data (the
+        incremental update, component 2). Returns a new instance rather than
+        mutating this one, since this one may still be the model clients
+        are filtering with this round.
+
+        Can't teach the model a class it was never trained on: that class's
+        predicted probability is ~0 everywhere, so its softmax hessian is ~0
+        and `min_sum_hessian_in_leaf` stops any tree for it from splitting
+        (`fl_ids.models.boosting_update` retrains from scratch instead).
+
+        Args:
+            X: Raw-scale features — typically the calibration set plus
+                every surfaced alert so far.
+            y: Integer labels.
+            num_boost_round: Trees to add.
+
+        Raises:
+            RuntimeError: If this model hasn't been trained or loaded.
+        """
+        if self._booster is None:
+            raise RuntimeError("Can't continue training a BoostingClassifier that was never trained")
+        updated = BoostingClassifier(
+            self.config, self.num_classes, self.benign_class, self.seed, self.confidence_threshold
+        )
+        updated._booster = lgb.train(
+            self._train_params(), lgb.Dataset(X, label=y), num_boost_round=num_boost_round, init_model=self._booster
+        )
+        logger.info(
+            "Continued boosting training: +%d trees on %d rows (now %d trees)",
+            num_boost_round, len(y), updated._booster.current_iteration(),
+        )
+        return updated
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Return per-class predicted probabilities, shape (n_samples, num_classes).

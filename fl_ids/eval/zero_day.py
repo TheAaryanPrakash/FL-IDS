@@ -136,7 +136,7 @@ def evaluate_zero_day_holdout(
         mode: _flags(X_holdout_raw, X_holdout_norm, holdout_clients, mode)
         for mode in ("boosting_only", "autoencoder_only", "cascade")
     }
-    confident = setup.boosting_model.predict_cascade_stage1(X_holdout_raw)
+    confident = trained.boosting_model.predict_cascade_stage1(X_holdout_raw)
     misattributed = pd.Series(
         np.array(setup.class_names, dtype=object)[confident.predicted_class[confident.is_confident_attack]]
     ).value_counts()

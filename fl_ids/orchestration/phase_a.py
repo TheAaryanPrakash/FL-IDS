@@ -54,7 +54,7 @@ PROCESS_POLL_SECONDS = 0.5
 
 @dataclass
 class PreparedData:
-    """Step 1-2 output: the bootstrap boosting model and every client's data."""
+    """Step 1-2 output: the bootstrap boosting model, the server's calibration data, and every client's data."""
 
     boosting_model: BoostingClassifier
     boosting_metrics: dict
@@ -62,6 +62,12 @@ class PreparedData:
     class_names: list[str]
     benign_class: int
     feature_names: list[str]
+    # Server-held: what boosting trains (and incrementally continues) on,
+    # and the split each boosting version is scored on.
+    X_calib: np.ndarray
+    y_calib: np.ndarray
+    X_calib_eval: np.ndarray
+    y_calib_eval: np.ndarray
 
 
 def prepare_data(
@@ -79,12 +85,19 @@ def prepare_data(
         config: Full project config.
 
     Returns:
-        A `PreparedData`. `boosting_metrics` is the bootstrap model's
-        held-out summary on the clients' test slices, which the dashboard
-        shows next to each round.
+        A `PreparedData`. `boosting_metrics` is the bootstrap model scored
+        on the server's held-back calibration split — the same split every
+        later boosting version is scored on — which the dashboard shows
+        next to each round.
     """
     X_calib, X_pool, y_calib, y_pool = train_test_split(
         X, y, train_size=config.boosting.calibration_fraction, random_state=config.seed, stratify=y
+    )
+    # Part of the calibration set stays with the server purely to score each
+    # boosting version, so the dashboard compares versions on the same data.
+    X_calib, X_calib_eval, y_calib, y_calib_eval = train_test_split(
+        X_calib, y_calib, test_size=config.boosting.calibration_eval_fraction,
+        random_state=config.seed, stratify=y_calib,
     )
     cap = config.orchestration.pool_subsample_size
     if len(X_pool) > cap:
@@ -94,17 +107,19 @@ def prepare_data(
         config.boosting, len(class_names), benign_class, config.seed, config.cascade.confidence_threshold
     )
     boosting_model.train(X_calib, y_calib)
+    boosting_metrics = stage_report_summary(
+        evaluate_boosting_alone(boosting_model, X_calib_eval, y_calib_eval, class_names, benign_class)
+    )
 
     client_data = partition_and_normalize_clients(X_pool, y_pool, benign_class, config.data, config.seed)
-    X_test_raw, _X_test_norm, y_test, _ids = concat_client_test_slices(client_data)
-    boosting_metrics = stage_report_summary(
-        evaluate_boosting_alone(boosting_model, X_test_raw, y_test, class_names, benign_class)
-    )
     logger.info(
         "Prepared %d calibration rows, %d federated rows across %d clients; bootstrap boosting accuracy %.3f",
         len(y_calib), len(y_pool), len(client_data), boosting_metrics["accuracy"],
     )
-    return PreparedData(boosting_model, boosting_metrics, client_data, class_names, benign_class, feature_names)
+    return PreparedData(
+        boosting_model, boosting_metrics, client_data, class_names, benign_class, feature_names,
+        X_calib, y_calib, X_calib_eval, y_calib_eval,
+    )
 
 
 def run_federated_training(
@@ -113,8 +128,8 @@ def run_federated_training(
     run_dir: Path,
     num_rounds: int,
     malicious_client_ids: set[int],
-) -> tuple[list[np.ndarray], list[dict]]:
-    """Run a real multi-process Flower training and return its final weights and per-round state.
+) -> tuple[list[np.ndarray], BoostingClassifier, list[dict]]:
+    """Run a real multi-process Flower training; return its final models and per-round state.
 
     Args:
         prepared: `prepare_data` output.
@@ -124,8 +139,9 @@ def run_federated_training(
         malicious_client_ids: Clients launched as sign-flip attackers.
 
     Returns:
-        (final global weights, per-round state from the trust-filtered
-        strategy — empty for plain FedAvg).
+        (final global weights, the boosting model broadcast at the end —
+        the bootstrap one plus any incremental updates, and per-round
+        state from the trust-filtered strategy — empty for plain FedAvg).
 
     Raises:
         RuntimeError: If any process fails or the run exceeds
@@ -137,8 +153,17 @@ def run_federated_training(
     boosting_path.write_bytes(prepared.boosting_model.to_bytes())
     metrics_path = run_dir / "boosting_metrics.json"
     metrics_path.write_text(json.dumps(prepared.boosting_metrics))
+    calibration_path = run_dir / "calibration.npz"
+    np.savez(
+        calibration_path,
+        X_calib=prepared.X_calib, y_calib=prepared.y_calib,
+        X_eval=prepared.X_calib_eval, y_eval=prepared.y_calib_eval,
+        class_names=np.array(prepared.class_names),
+    )
     weights_path = run_dir / "final_weights.npz"
     weights_path.unlink(missing_ok=True)
+    final_boosting_path = run_dir / "final_boosting_model.txt"
+    final_boosting_path.unlink(missing_ok=True)
     live_state_path = Path(config.orchestration.live_state_path)
     live_state_path.unlink(missing_ok=True)  # never let the dashboard show a previous run
 
@@ -158,6 +183,8 @@ def run_federated_training(
         "--strategy", strategy,
         "--history-output", str(run_dir / "history.json"),
         "--final-weights-output", str(weights_path),
+        "--final-boosting-output", str(final_boosting_path),
+        "--calibration-data-path", str(calibration_path),
         "--live-state-path", str(live_state_path),
     ]
 
@@ -217,8 +244,12 @@ def run_federated_training(
 
     with np.load(weights_path) as npz:
         final_weights = [npz[f"arr_{i}"] for i in range(len(npz.files))]
+    final_boosting = BoostingClassifier.from_bytes(
+        final_boosting_path.read_bytes(), config.boosting, len(prepared.class_names), prepared.benign_class,
+        config.seed, config.cascade.confidence_threshold,
+    )
     round_history = json.loads(live_state_path.read_text()) if live_state_path.exists() else []
-    return final_weights, round_history
+    return final_weights, final_boosting, round_history
 
 
 def calibrate_thresholds(
@@ -326,14 +357,16 @@ def run_phase_a(
     malicious = select_malicious_clients(
         list(prepared.client_data), config.orchestration.malicious_fraction, config.seed
     )
-    final_weights, round_history = run_federated_training(prepared, config, run_dir, num_rounds, malicious)
+    final_weights, final_boosting, round_history = run_federated_training(
+        prepared, config, run_dir, num_rounds, malicious
+    )
 
     autoencoder = Autoencoder(len(feature_names), config.autoencoder.hidden_dims, config.autoencoder.bottleneck_dim)
     set_weights(autoencoder, final_weights)
     thresholds = calibrate_thresholds(
         autoencoder, prepared.client_data, config.autoencoder.anomaly_percentile, round_history
     )
-    test_metrics = evaluate_bundle(prepared.boosting_model, autoencoder, thresholds, prepared, config)
+    test_metrics = evaluate_bundle(final_boosting, autoencoder, thresholds, prepared, config)
 
     scalers = {}
     for cid, data in prepared.client_data.items():
@@ -344,9 +377,10 @@ def run_phase_a(
             scalers[cid] = (np.zeros(len(feature_names)), np.ones(len(feature_names)))
 
     last_round = round_history[-1] if round_history else {}
+    updates = [entry["boosting_update"] for entry in round_history if entry.get("boosting_update")]
     save_phase_a_artifacts(
         artifact_dir,
-        prepared.boosting_model,
+        final_boosting,
         final_weights,
         prepared.class_names,
         benign_class,
@@ -367,6 +401,7 @@ def run_phase_a(
                 "final_trust_scores": last_round.get("trust_scores", {}),
                 "final_survivors": last_round.get("survivors", []),
                 "final_mean_reconstruction_error": last_round.get("mean_reconstruction_error"),
+                "boosting_updates": updates,
             },
             "provenance": {
                 "seed": config.seed,

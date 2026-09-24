@@ -26,6 +26,7 @@ import torch
 from fl_ids.fl.client import AutoencoderClient
 from fl_ids.models.autoencoder import Autoencoder, get_weights, set_weights
 from fl_ids.models.boosting import BoostingClassifier
+from fl_ids.models.boosting_update import SURFACE_ALERTS_KEY, BoostingUpdater, BoostingUpdateRecord, decode_alerts
 from fl_ids.robustness.aggregation import apply_delta, trimmed_mean_delta
 from fl_ids.robustness.attackers import SignFlipAttackerClient
 from fl_ids.robustness.trust_filter import TrustTracker, compute_delta, filter_client_deltas, flatten_weights
@@ -45,6 +46,7 @@ class SimulationRoundRecord:
     communication_bytes: int
     trust_scores: dict[int, float] | None = None
     survivors: list[int] | None = None
+    boosting_update: BoostingUpdateRecord | None = None
 
 
 @dataclass
@@ -53,6 +55,9 @@ class SimulationResult:
 
     final_weights: list[np.ndarray]
     rounds: list[SimulationRoundRecord] = field(default_factory=list)
+    # The boosting model broadcast at the end: the input model, plus any
+    # incremental updates.
+    final_boosting_model: BoostingClassifier | None = None
 
     @property
     def total_communication_bytes(self) -> int:
@@ -96,12 +101,11 @@ def _make_clients(
     clients = {}
     for cid, data in client_data.items():
         args = (cid, data["X"], data["X_raw"], data["X_val_benign"], config, input_dim)
+        kwargs = {"use_boosting_filter": use_boosting_filter, "y_train": data["y"]}
         if cid in malicious_client_ids:
-            clients[cid] = SignFlipAttackerClient(
-                *args, use_boosting_filter=use_boosting_filter, amplification=amplification
-            )
+            clients[cid] = SignFlipAttackerClient(*args, amplification=amplification, **kwargs)
         else:
-            clients[cid] = AutoencoderClient(*args, use_boosting_filter=use_boosting_filter)
+            clients[cid] = AutoencoderClient(*args, **kwargs)
     return clients
 
 
@@ -117,6 +121,7 @@ def run_simulated_fl_training(
     use_boosting_filter: bool = True,
     amplification: float = 5.0,
     seed: int = 0,
+    boosting_updater: BoostingUpdater | None = None,
 ) -> SimulationResult:
     """Run `num_rounds` of in-process FL training and return per-round diagnostics.
 
@@ -140,6 +145,11 @@ def run_simulated_fl_training(
             no boosting pre-filter" ablation case).
         amplification: Sign-flip attacker delta amplification.
         seed: Random seed for initial global weights.
+        boosting_updater: If given, the incremental boosting update
+            (component 2), exactly as `TrustFilteredStrategy` runs it: on
+            update rounds clients surface alerts, and those from surviving
+            clients (every client, for the aggregation modes without a
+            trust filter) continue boosting's training for later rounds.
 
     Returns:
         A `SimulationResult` with final weights and per-round diagnostics
@@ -148,6 +158,7 @@ def run_simulated_fl_training(
     """
     malicious_client_ids = malicious_client_ids or set()
     input_dim = next(iter(client_data.values()))["X"].shape[1]
+    input_dim_raw = next(iter(client_data.values()))["X_raw"].shape[1]
 
     clients = _make_clients(client_data, config, input_dim, malicious_client_ids, use_boosting_filter, amplification)
 
@@ -164,19 +175,23 @@ def run_simulated_fl_training(
     result = SimulationResult(final_weights=global_weights)
 
     for round_num in range(1, num_rounds + 1):
+        update_round = boosting_updater is not None and boosting_updater.is_update_round(round_num)
         fit_config = {
             "boosting_model_bytes": boosting_bytes,
             "num_classes": num_classes,
             "benign_class": benign_class,
             "server_round": round_num,
+            SURFACE_ALERTS_KEY: update_round,
         }
 
         fit_results: dict[int, tuple[list[np.ndarray], int]] = {}
+        fit_metrics: dict[int, dict] = {}
         comm_bytes = 0
         down_bytes = flatten_weights(global_weights).nbytes
         for cid, client in clients.items():
-            new_weights, num_examples, _metrics = client.fit(global_weights, fit_config)
+            new_weights, num_examples, metrics = client.fit(global_weights, fit_config)
             fit_results[cid] = (new_weights, num_examples)
+            fit_metrics[cid] = metrics
             comm_bytes += down_bytes + flatten_weights(new_weights).nbytes
 
         trust_scores = None
@@ -202,6 +217,13 @@ def run_simulated_fl_training(
         else:
             raise ValueError(f"Unknown aggregation mode: {aggregation}")
 
+        update_record = None
+        if update_round:
+            alerts = {cid: decode_alerts(m, input_dim_raw) for cid, m in fit_metrics.items()}
+            surviving = set(survivors) if survivors is not None else set(clients)
+            boosting_model, update_record = boosting_updater.update(boosting_model, round_num, alerts, surviving)
+            boosting_bytes = boosting_model.to_bytes()
+
         val_losses, val_weights = [], []
         for client in clients.values():
             loss, num_examples, _ = client.evaluate(global_weights, {})
@@ -217,9 +239,11 @@ def run_simulated_fl_training(
                 communication_bytes=comm_bytes,
                 trust_scores=trust_scores,
                 survivors=survivors,
+                boosting_update=update_record,
             )
         )
         logger.info("Round %d: mean_val_loss=%.4f, comm_bytes=%d", round_num, mean_val_loss, comm_bytes)
 
     result.final_weights = global_weights
+    result.final_boosting_model = boosting_model
     return result

@@ -21,6 +21,8 @@ from fl_ids.eval.common import EvaluationSetup, calibrate_client_thresholds, per
 from fl_ids.eval.metrics import detection_metrics, flag_attacks
 from fl_ids.eval.simulation import SimulationResult, run_simulated_fl_training
 from fl_ids.models.autoencoder import Autoencoder
+from fl_ids.models.boosting import BoostingClassifier
+from fl_ids.models.boosting_update import BoostingUpdater
 from fl_ids.utils.config import Config
 
 logger = logging.getLogger(__name__)
@@ -61,9 +63,14 @@ ABLATION_VARIANTS: list[Variant] = [
 
 @dataclass
 class TrainedVariant:
-    """A variant after training: its autoencoder and per-client thresholds, if it has one."""
+    """A variant after training: its final boosting model, and its autoencoder and per-client thresholds if it has one.
+
+    `boosting_model` differs from the setup's bootstrap model when the
+    incremental update ran during training.
+    """
 
     variant: Variant
+    boosting_model: BoostingClassifier
     autoencoder: Autoencoder | None
     thresholds: dict[int, float] | None
     simulation: SimulationResult | None
@@ -91,7 +98,11 @@ def train_variant(
         The trained variant.
     """
     if variant.aggregation is None:
-        return TrainedVariant(variant, None, None, None)
+        # No autoencoder, so no alerts: boosting-only never gets updated.
+        return TrainedVariant(variant, setup.boosting_model, None, None, None)
+    updater = None
+    if config.boosting.update_every_n_rounds > 0 and setup.X_calib is not None:
+        updater = BoostingUpdater(config.boosting, setup.X_calib, setup.y_calib, setup.class_names)
     result = run_simulated_fl_training(
         setup.client_data,
         setup.boosting_model,
@@ -103,9 +114,10 @@ def train_variant(
         malicious_client_ids=malicious_client_ids,
         use_boosting_filter=variant.use_boosting_filter,
         seed=seed,
+        boosting_updater=updater,
     )
     autoencoder, thresholds = calibrate_client_thresholds(result.final_weights, setup, config)
-    return TrainedVariant(variant, autoencoder, thresholds, result)
+    return TrainedVariant(variant, result.final_boosting_model, autoencoder, thresholds, result)
 
 
 def flag_rows(
@@ -135,7 +147,7 @@ def flag_rows(
     thresholds = per_row_thresholds(trained.thresholds, client_ids) if trained.thresholds is not None else None
     return flag_attacks(
         mode or trained.variant.detection_mode,
-        setup.boosting_model,
+        trained.boosting_model,
         trained.autoencoder,
         thresholds,
         X_raw,

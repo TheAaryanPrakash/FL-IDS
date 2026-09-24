@@ -46,6 +46,16 @@ class BoostingConfig:
     # (see fl_ids.models.boosting's train()). Defaults are the validated values.
     min_sum_hessian_in_leaf: float = 1.0
     lambda_l2: float = 1.0
+    # Incremental update (fl_ids.models.boosting_update): every
+    # update_every_n_rounds rounds (0 = never), surviving clients surface up
+    # to alert_budget_per_client autoencoder-flagged rows with their
+    # analyst-confirmed labels, and the server continues training with
+    # update_num_boost_round more trees (LightGBM init_model).
+    update_num_boost_round: int = 50
+    alert_budget_per_client: int = 50
+    # Share of the server's calibration set held back to score each
+    # boosting version (Phase A), so versions are compared on the same data.
+    calibration_eval_fraction: float = 0.2
 
 
 @dataclass

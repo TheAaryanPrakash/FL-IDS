@@ -13,6 +13,11 @@ Subclasses `FedAvg`, overriding:
 - `aggregate_evaluate`: folds each round's reconstruction-error loss into
   the same `round_history` entry, so one file has everything the
   dashboard (component 13) needs.
+- With a `boosting_updater`, the incremental boosting update (component
+  2, `fl_ids.models.boosting_update`): update rounds ask clients to
+  surface analyst-confirmed alerts, and `aggregate_fit` feeds only the
+  trust filter's survivors' alerts into the update, broadcasting the new
+  version from the next round.
 
 When `live_state_path` is given, `round_history` is written to that path
 as JSON after every round — the dashboard polls this file rather than
@@ -23,6 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -32,6 +38,13 @@ from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
 from flwr.server.strategy import FedAvg
 
+from fl_ids.models.boosting import BoostingClassifier
+from fl_ids.models.boosting_update import (
+    SURFACE_ALERTS_KEY,
+    BoostingUpdater,
+    BoostingUpdateRecord,
+    decode_alerts,
+)
 from fl_ids.robustness.aggregation import apply_delta, trimmed_mean_delta
 from fl_ids.robustness.trust_filter import TrustTracker, compute_delta, filter_client_deltas
 from fl_ids.utils.config import Config
@@ -50,6 +63,7 @@ class TrustFilteredStrategy(FedAvg):
         benign_class: int,
         live_state_path: str | Path | None = None,
         boosting_metrics: dict | None = None,
+        boosting_updater: BoostingUpdater | None = None,
         **kwargs,
     ) -> None:
         """Initialize the strategy.
@@ -70,6 +84,12 @@ class TrustFilteredStrategy(FedAvg):
                 `boosting_model_version` so the dashboard shows which
                 boosting model clients filtered with that round, and how
                 good it was.
+            boosting_updater: If given, the incremental update (component
+                2, `fl_ids.models.boosting_update`): on its update rounds,
+                clients surface analyst-confirmed alerts, and the alerts
+                from clients that survive the trust filter continue the
+                boosting model's training; the new version is broadcast
+                from the next round on.
             **kwargs: Forwarded to `FedAvg.__init__` (min_fit_clients,
                 initial_parameters, etc.).
         """
@@ -79,10 +99,9 @@ class TrustFilteredStrategy(FedAvg):
         self.num_classes = num_classes
         self.benign_class = benign_class
         self.live_state_path = Path(live_state_path) if live_state_path else None
-        # Bumped whenever `boosting_model_bytes` is replaced. Component 2's
-        # incremental update isn't implemented yet, so today this stays at 1
-        # for the whole run.
+        # Bumped whenever the incremental update replaces `boosting_model_bytes`.
         self.boosting_model_version = 1
+        self.boosting_updater = boosting_updater
         self.boosting_metrics = boosting_metrics
         self.trust_tracker = TrustTracker(config.robustness.trust_ema_alpha)
         self._round_start_weights: list = []
@@ -111,6 +130,7 @@ class TrustFilteredStrategy(FedAvg):
             "num_classes": self.num_classes,
             "benign_class": self.benign_class,
             "server_round": server_round,
+            SURFACE_ALERTS_KEY: bool(self.boosting_updater and self.boosting_updater.is_update_round(server_round)),
         }
         # Reuse FedAvg's client-sampling logic; just swap in our fit config.
         sampled = super().configure_fit(server_round, parameters, client_manager)
@@ -134,11 +154,13 @@ class TrustFilteredStrategy(FedAvg):
 
         client_deltas: dict[int, np.ndarray] = {}
         filtered_fractions: dict[int, float] = {}
+        client_metrics: dict[int, dict] = {}
         for client_proxy, fit_res in results:
             new_weights = parameters_to_ndarrays(fit_res.parameters)
             delta = compute_delta(new_weights, self._round_start_weights)
             cid = int(fit_res.metrics.get("client_id", hash(getattr(client_proxy, "cid", id(client_proxy)))))
             client_deltas[cid] = delta
+            client_metrics[cid] = fit_res.metrics
             if "filtered_fraction" in fit_res.metrics:
                 filtered_fractions[cid] = float(fit_res.metrics["filtered_fraction"])
 
@@ -153,6 +175,11 @@ class TrustFilteredStrategy(FedAvg):
             {cid: round(trust_scores[cid], 3) for cid in filter_result.client_ids},
         )
 
+        # The version clients filtered with this round; an update below takes
+        # effect from the next round's broadcast.
+        broadcast_version, broadcast_metrics = self.boosting_model_version, self.boosting_metrics
+        update_record = self._maybe_update_boosting(server_round, client_metrics, set(filter_result.survivors))
+
         self.round_history.append(
             {
                 "round": server_round,
@@ -162,8 +189,9 @@ class TrustFilteredStrategy(FedAvg):
                 "survivors": list(filter_result.survivors),
                 "filtered_fractions": filtered_fractions,
                 "mean_filtered_fraction": float(np.mean(list(filtered_fractions.values()))) if filtered_fractions else None,
-                "boosting_model_version": self.boosting_model_version,
-                "boosting_metrics": self.boosting_metrics,
+                "boosting_model_version": broadcast_version,
+                "boosting_metrics": broadcast_metrics,
+                "boosting_update": asdict(update_record) if update_record else None,
             }
         )
         self._write_live_state()
@@ -179,6 +207,28 @@ class TrustFilteredStrategy(FedAvg):
         self.latest_weights = new_global_weights
 
         return ndarrays_to_parameters(new_global_weights), {"num_survivors": len(filter_result.survivors)}
+
+    def _maybe_update_boosting(
+        self, server_round: int, client_metrics: dict[int, dict], survivors: set[int]
+    ) -> BoostingUpdateRecord | None:
+        """Run the incremental update on an update round, swapping in the new model for later broadcasts."""
+        updater = self.boosting_updater
+        if updater is None or not updater.is_update_round(server_round):
+            return None
+        num_features = updater.X_calib.shape[1]
+        alerts = {cid: decode_alerts(metrics, num_features) for cid, metrics in client_metrics.items()}
+        current = BoostingClassifier.from_bytes(
+            self.boosting_model_bytes, self.config.boosting, self.num_classes, self.benign_class,
+            self.config.seed, self.config.cascade.confidence_threshold,
+        )
+        updated, record = updater.update(current, server_round, alerts, survivors)
+        if record is not None:
+            self.boosting_model_bytes = updated.to_bytes()
+            self.boosting_model_version = record.version
+            # None when the updater has no eval set: better no numbers than the
+            # previous version's numbers shown against the new version.
+            self.boosting_metrics = record.metrics
+        return record
 
     def aggregate_evaluate(
         self,

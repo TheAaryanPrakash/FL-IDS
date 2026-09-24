@@ -34,7 +34,19 @@ boosting:
   min_sum_hessian_in_leaf: 1.0
   lambda_l2: 1.0
   broadcast_every_n_rounds: 1
-  update_every_n_rounds: 3  # incremental update cadence using aggregated histograms
+  # Incremental update (component 2): every update_every_n_rounds rounds
+  # (0 = never), clients that survived the trust filter surface up to
+  # alert_budget_per_client rows their autoencoder flagged, with the label an
+  # analyst would confirm (false alarms come back as Normal). The server adds
+  # them to what it has collected and continues training with
+  # update_num_boost_round more trees (LightGBM init_model). This relaxes
+  # "raw traffic never leaves a client" for confirmed alerts only, capped.
+  update_every_n_rounds: 3
+  update_num_boost_round: 50
+  alert_budget_per_client: 50
+  # Share of the server's calibration set held back to score each boosting
+  # version in Phase A (the dashboard's per-version metrics).
+  calibration_eval_fraction: 0.2
 
 autoencoder:
   bottleneck_dim: 8

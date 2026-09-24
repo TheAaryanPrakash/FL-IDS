@@ -59,6 +59,10 @@ class EvaluationSetup:
     # Classes removed from the calibration set and the federated pool
     # before training (the zero-day experiment's "never seen" attack types).
     excluded_classes: frozenset[int] = frozenset()
+    # The server-held calibration set boosting was trained on, which the
+    # incremental update continues from (fl_ids.models.boosting_update).
+    X_calib: np.ndarray | None = None
+    y_calib: np.ndarray | None = None
 
 
 def concat_client_test_slices(
@@ -214,6 +218,8 @@ def build_evaluation_setup_from_arrays(
         test_client_ids=test_client_ids,
         client_scalers=client_scalers,
         excluded_classes=frozenset(excluded_classes),
+        X_calib=X_calib,
+        y_calib=y_calib,
     )
 
 

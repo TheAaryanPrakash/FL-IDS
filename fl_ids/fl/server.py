@@ -24,6 +24,7 @@ from flwr.server.history import History
 from flwr.server.strategy import FedAvg, Strategy
 
 from fl_ids.fl.strategy import TrustFilteredStrategy
+from fl_ids.models.boosting_update import BoostingUpdater
 from fl_ids.models.autoencoder import Autoencoder, get_weights
 from fl_ids.utils.config import Config
 
@@ -125,6 +126,40 @@ def build_strategy(
     )
 
 
+def build_boosting_updater(
+    config: Config, calibration_data_path: str, benign_class: int
+) -> BoostingUpdater | None:
+    """Build the incremental boosting updater from the server-held calibration data, if enabled.
+
+    Args:
+        config: Full project config (`boosting.update_every_n_rounds`; 0 disables).
+        calibration_data_path: `.npz` with `X_calib`, `y_calib`, `class_names`,
+            and optionally `X_eval`/`y_eval` (a server-held split each new
+            version is scored on).
+        benign_class: Integer class index corresponding to "Normal".
+
+    Returns:
+        A `BoostingUpdater`, or None if updates are disabled.
+    """
+    import numpy as np
+
+    from fl_ids.eval.metrics import evaluate_boosting_alone, stage_report_summary
+
+    if config.boosting.update_every_n_rounds <= 0:
+        return None
+    with np.load(calibration_data_path, allow_pickle=False) as npz:
+        data = {key: npz[key] for key in npz.files}
+    class_names = [str(name) for name in data["class_names"]]
+    evaluate = None
+    if "X_eval" in data:
+        X_eval, y_eval = data["X_eval"], data["y_eval"]
+
+        def evaluate(model):
+            return stage_report_summary(evaluate_boosting_alone(model, X_eval, y_eval, class_names, benign_class))
+
+    return BoostingUpdater(config.boosting, data["X_calib"], data["y_calib"], class_names, evaluate=evaluate)
+
+
 def build_trust_filtered_strategy(
     config: Config,
     boosting_model_bytes: bytes,
@@ -134,6 +169,7 @@ def build_trust_filtered_strategy(
     min_clients: int,
     live_state_path: str | None = None,
     boosting_metrics: dict | None = None,
+    boosting_updater: BoostingUpdater | None = None,
 ) -> TrustFilteredStrategy:
     """Build the Phase 4 trust-filtered strategy (component 7).
 
@@ -142,6 +178,8 @@ def build_trust_filtered_strategy(
             the dashboard (component 13) can poll live per-round state.
         boosting_metrics: If given, forwarded to `TrustFilteredStrategy`
             (the broadcast boosting model's held-out metrics).
+        boosting_updater: If given, forwarded to `TrustFilteredStrategy`
+            (the incremental boosting update, component 2).
         (remaining args: same as `build_strategy`.)
 
     Returns:
@@ -154,6 +192,7 @@ def build_trust_filtered_strategy(
         benign_class,
         live_state_path=live_state_path,
         boosting_metrics=boosting_metrics,
+        boosting_updater=boosting_updater,
         fraction_fit=1.0,
         fraction_evaluate=1.0,
         min_fit_clients=min_clients,
@@ -225,6 +264,14 @@ if __name__ == "__main__":
         "recorded in the live state for the dashboard",
     )
     parser.add_argument(
+        "--calibration-data-path", default=None,
+        help="Server-held calibration data (.npz) for the incremental boosting update; omit to disable updates",
+    )
+    parser.add_argument(
+        "--final-boosting-output", default=None,
+        help="Save the boosting model as broadcast at the end of the run (after any incremental updates)",
+    )
+    parser.add_argument(
         "--final-weights-output", default=None,
         help="Save the final global autoencoder weights to this .npz (Phase A's trained model)",
     )
@@ -236,9 +283,13 @@ if __name__ == "__main__":
     boosting_metrics = json.loads(Path(args.boosting_metrics_path).read_text()) if args.boosting_metrics_path else None
 
     if args.strategy == "custom_trust_filtered":
+        updater = (
+            build_boosting_updater(run_config, args.calibration_data_path, args.benign_class)
+            if args.calibration_data_path else None
+        )
         strategy = build_trust_filtered_strategy(
             run_config, model_bytes, args.num_classes, args.benign_class, args.input_dim, args.min_clients,
-            live_state_path=args.live_state_path, boosting_metrics=boosting_metrics,
+            live_state_path=args.live_state_path, boosting_metrics=boosting_metrics, boosting_updater=updater,
         )
     else:
         strategy = build_strategy(
@@ -260,6 +311,11 @@ if __name__ == "__main__":
         output["round_history"] = strategy.round_history
 
     Path(args.history_output).write_text(json.dumps(output))
+
+    if args.final_boosting_output:
+        final_bytes = strategy.boosting_model_bytes if isinstance(strategy, TrustFilteredStrategy) else model_bytes
+        Path(args.final_boosting_output).write_bytes(final_bytes)
+        logger.info("Saved final boosting model to %s", args.final_boosting_output)
 
     if args.final_weights_output:
         import numpy as np

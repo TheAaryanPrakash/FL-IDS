@@ -182,3 +182,22 @@ def test_phase_a_fails_fast_when_a_client_process_dies(tmp_path):
         run_federated_training(prepared, config, tmp_path / "run", num_rounds=3, malicious_client_ids=set())
     # Well under the 300s timeout: the dead client is noticed, not waited out.
     assert time.monotonic() - started < 120
+
+
+def test_phase_a_runs_the_incremental_boosting_update_and_saves_the_updated_model(phase_a_run):
+    config, bundle_dir, tmp_path = phase_a_run
+    assert config.boosting.update_every_n_rounds == 3  # the run has 3 rounds: one update, in round 3
+    live_state = json.loads((tmp_path / "live_state.json").read_text())
+    manifest = json.loads((bundle_dir / MANIFEST_FILE).read_text())
+
+    update = live_state[2]["boosting_update"]
+    assert [entry["boosting_update"] for entry in live_state[:2]] == [None, None]
+    assert update is not None and update["version"] == 2 and update["alerts_used"] > 0
+    # Each version is scored on the server's held-back calibration split.
+    assert update["metrics"]["accuracy"] > 0
+    assert manifest["training"]["boosting_updates"] == [update]
+
+    # The bundle holds the updated model the server broadcast last, not the bootstrap.
+    saved = (bundle_dir / "boosting_model.txt").read_bytes()
+    assert saved == (tmp_path / "run" / "final_boosting_model.txt").read_bytes()
+    assert saved != (tmp_path / "run" / "boosting_model.txt").read_bytes()
