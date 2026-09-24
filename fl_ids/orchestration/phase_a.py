@@ -358,7 +358,7 @@ def run_phase_a(
     artifact_dir = Path(artifact_dir or config.orchestration.artifact_dir)
     run_dir = Path(run_dir or config.orchestration.run_dir)
 
-    X, y, label_encoder, feature_names, benign_class = load_and_encode(csv_path)
+    X, y, label_encoder, feature_names, benign_class = load_and_encode(csv_path, config.data.capture_repairs)
     prepared = prepare_data(X, y, list(label_encoder.classes_), benign_class, feature_names, config)
 
     malicious = select_malicious_clients(

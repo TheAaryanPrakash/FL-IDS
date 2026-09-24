@@ -94,7 +94,8 @@ def phase_a_run(tmp_path_factory):
     config = load_config()
     config = dataclasses.replace(
         config,
-        data=dataclasses.replace(config.data, num_clients=3, dirichlet_alpha=1.0),
+        # The production MITM repair targets the real dataset's rows, not this synthetic CSV.
+        data=dataclasses.replace(config.data, num_clients=3, dirichlet_alpha=1.0, capture_repairs={}),
         boosting=dataclasses.replace(config.boosting, calibration_fraction=0.3, num_boost_round=30),
         autoencoder=dataclasses.replace(config.autoencoder, local_epochs=2),
         logging=dataclasses.replace(config.logging, level="WARNING"),

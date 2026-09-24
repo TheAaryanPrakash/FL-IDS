@@ -150,7 +150,7 @@ if __name__ == "__main__":
     output_dir = Path(args.output_dir or run_config.evaluation.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    X_all, y_all, label_encoder, _feature_names, benign = load_and_encode(args.real_csv_path)
+    X_all, y_all, label_encoder, _feature_names, benign = load_and_encode(args.real_csv_path, run_config.data.capture_repairs)
     names = list(label_encoder.classes_)
     eval_setup = build_evaluation_setup_from_arrays(X_all, y_all, names, benign, run_config, args.seed)
     ablation_df, per_class_df = run_ablation(

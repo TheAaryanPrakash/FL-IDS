@@ -14,6 +14,13 @@ data:
   val_benign_fraction: 0.15
   test_fraction: 0.15
   normalize_per_client: true
+  # Captures whose rows in the dataset are column-shifted, replaced by rows
+  # re-extracted from the authors' own .pcap (fl_ids.data.repair). MITM's
+  # CSV has e.g. udp.time_delta under tcp.seq. Generate with:
+  #   python -m fl_ids.data.repair --pcap "data/raw/pcaps/MITM (ARP spoofing + DNS) Attack.pcap" \
+  #     --attack-type MITM --output data/processed/MITM_reextracted.csv
+  capture_repairs:
+    MITM: "data/processed/MITM_reextracted.csv"
 
 boosting:
   # LightGBM first-pass classifier.

@@ -24,6 +24,9 @@ class DataConfig:
     val_benign_fraction: float
     test_fraction: float
     normalize_per_client: bool
+    # {attack_type: re-extracted CSV} for captures whose rows in the dataset
+    # are column-shifted (fl_ids.data.repair). Empty loads the CSV as is.
+    capture_repairs: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

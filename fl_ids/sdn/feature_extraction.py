@@ -71,6 +71,10 @@ FEATURE_FIELDS: list[str] = [f for f in ALL_WIRESHARK_FIELDS if f not in DEFAULT
 _HEX_LIKE_PREFIX = "0x"
 _BOOLEAN_VALUES = {"True": 1.0, "False": 0.0}
 _HEX_VALUE = re.compile(r"0x[0-9a-fA-F]+")
+# Text fields the dataset stores as 0 (its authors dropped the query name
+# text; the column survives in the schema as ~all zeros), so a name here is
+# expected and not worth a warning.
+_TEXT_FIELDS_STORED_AS_ZERO = {"dns.qry.name"}
 
 
 def _stage_in_tmp(pcap_path: str | Path) -> Path:
@@ -139,7 +143,7 @@ def _to_numeric(series: pd.Series) -> pd.Series:
             return 0.0
 
     converted = series.map(convert)
-    if unparseable:
+    if unparseable and series.name not in _TEXT_FIELDS_STORED_AS_ZERO:
         logger.warning(
             "%s: %d values couldn't be parsed as numbers and were set to 0 (e.g. %r)",
             series.name, len(unparseable), unparseable[0],

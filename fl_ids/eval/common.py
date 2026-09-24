@@ -105,7 +105,7 @@ def build_evaluation_setup(
     Returns:
         An `EvaluationSetup` (see `build_evaluation_setup_from_arrays`).
     """
-    X, y, label_encoder, _feature_names, benign_class = load_and_encode(real_csv_path)
+    X, y, label_encoder, _feature_names, benign_class = load_and_encode(real_csv_path, config.data.capture_repairs)
     return build_evaluation_setup_from_arrays(
         X, y, list(label_encoder.classes_), benign_class, config, seed, pool_subsample_size
     )

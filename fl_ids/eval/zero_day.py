@@ -368,7 +368,7 @@ if __name__ == "__main__":
     output_dir = Path(args.output_dir or run_config.evaluation.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    X_all, y_all, label_encoder, _feature_names, benign = load_and_encode(args.real_csv_path)
+    X_all, y_all, label_encoder, _feature_names, benign = load_and_encode(args.real_csv_path, run_config.data.capture_repairs)
     results_df = run_zero_day_experiment(
         X_all, y_all, list(label_encoder.classes_), benign, run_config,
         num_rounds=args.num_rounds, seed=args.seed,

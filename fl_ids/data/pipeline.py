@@ -361,7 +361,9 @@ def partition_and_normalize_clients(
     return client_data
 
 
-def load_and_encode(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray, LabelEncoder, list[str], int]:
+def load_and_encode(
+    csv_path: str | Path, capture_repairs: dict[str, str] | None = None
+) -> tuple[np.ndarray, np.ndarray, LabelEncoder, list[str], int]:
     """Load, clean, and encode the raw CSV into a feature matrix and integer labels.
 
     Shared by `build_federated_dataset` and
@@ -371,6 +373,9 @@ def load_and_encode(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray, Label
 
     Args:
         csv_path: Path to `DNN-EdgeIIoT-dataset.csv`.
+        capture_repairs: `{attack_type: re-extracted CSV}` — rows of these
+            attack types are replaced before cleaning (`data.capture_repairs`,
+            see `fl_ids.data.repair`). None or empty loads the CSV as is.
 
     Returns:
         (X, y, label_encoder, feature_names, benign_class).
@@ -380,6 +385,10 @@ def load_and_encode(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray, Label
             (would indicate a bug in `clean_dataframe`).
     """
     df = load_raw_csv(csv_path)
+    if capture_repairs:
+        from fl_ids.data.repair import apply_capture_repairs  # imports live extraction, which imports this module
+
+        df = apply_capture_repairs(df, capture_repairs)
     df = canonicalize_placeholders(df)
     df = clean_dataframe(df)
     df = one_hot_encode_categoricals(df)
@@ -418,7 +427,7 @@ def build_federated_dataset(
           integer classes used in `y`.
         - The list of feature column names, in `X` column order.
     """
-    X, y, label_encoder, feature_names, benign_class = load_and_encode(csv_path)
+    X, y, label_encoder, feature_names, benign_class = load_and_encode(csv_path, config.capture_repairs)
     client_data = partition_and_normalize_clients(X, y, benign_class, config, seed)
     return client_data, label_encoder, feature_names
 
@@ -455,7 +464,7 @@ def build_server_and_federated_dataset(
         standardizes it however the boosting model expects (see
         `fl_ids.models.boosting`'s feature-scale design decision).
     """
-    X, y, label_encoder, feature_names, benign_class = load_and_encode(csv_path)
+    X, y, label_encoder, feature_names, benign_class = load_and_encode(csv_path, config.capture_repairs)
 
     X_calib, X_pool, y_calib, y_pool = train_test_split(
         X, y, train_size=calibration_fraction, random_state=seed, stratify=y
