@@ -68,6 +68,7 @@ ALL_WIRESHARK_FIELDS: list[str] = [
 FEATURE_FIELDS: list[str] = [f for f in ALL_WIRESHARK_FIELDS if f not in DEFAULT_DROP_COLUMNS]
 
 _HEX_LIKE_PREFIX = "0x"
+_BOOLEAN_VALUES = {"True": 1.0, "False": 0.0}
 
 
 def _stage_in_tmp(pcap_path: str | Path) -> Path:
@@ -104,28 +105,44 @@ def extract_raw_fields(pcap_path: str | Path) -> pd.DataFrame:
 
 
 def _to_numeric(series: pd.Series) -> pd.Series:
-    """Convert a raw tshark field column to floats, handling hex-formatted values.
+    """Convert a raw tshark field column to floats, handling hex and boolean renderings.
 
     Some fields (e.g. checksums) tshark renders as hex strings (`"0x2ea2"`)
-    rather than the plain decimal the source CSV used — converted here so
-    downstream numeric handling matches component 1's pipeline. Missing
+    rather than the plain decimal the source CSV used, and newer tshark
+    (4.x) renders boolean fields such as `tcp.flags.ack` as `True`/`False`
+    where the dataset authors' version wrote `1`/`0` — both converted here
+    so downstream numeric handling matches component 1's pipeline. Missing
     values become 0, matching the dataset's own convention for fields
     that don't apply to a given packet (e.g. `tcp.*` fields on a
     non-TCP packet).
+
+    Anything else unparseable also becomes 0, but is logged: a silent
+    fallback here once zeroed `tcp.flags.ack` on every packet (tshark 4.6's
+    `True`), and live rows stopped matching the training rows.
     """
+    unparseable: list[str] = []
 
     def convert(value):
         if pd.isna(value) or value == "":
             return 0.0
         text = str(value)
+        if text in _BOOLEAN_VALUES:
+            return _BOOLEAN_VALUES[text]
         if text.startswith(_HEX_LIKE_PREFIX):
             return float(int(text, 16))
         try:
             return float(text)
         except ValueError:
+            unparseable.append(text)
             return 0.0
 
-    return series.map(convert)
+    converted = series.map(convert)
+    if unparseable:
+        logger.warning(
+            "%s: %d values couldn't be parsed as numbers and were set to 0 (e.g. %r)",
+            series.name, len(unparseable), unparseable[0],
+        )
+    return converted
 
 
 # A field that doesn't apply to a packet comes out of tshark empty. The
