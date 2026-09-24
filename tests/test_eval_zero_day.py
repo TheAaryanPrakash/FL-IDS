@@ -50,17 +50,20 @@ def test_excluded_class_never_reaches_any_training_data(synthetic):
     assert setup.boosting_model.predict_proba(holdout_rows)[:, holdout].max() < 1e-3
 
 
-def test_exclusion_leaves_the_shared_test_set_unchanged(synthetic):
+def test_excluded_class_never_shapes_any_clients_normalization(synthetic):
+    # The held-out class is removed before partitioning, so no client's
+    # scaler statistics (and no test slice) include it.
     X, y, class_names = synthetic
     config = _config(num_clients=5, poisoning_fractions=[0.0])
+    holdout = class_names.index("XSS")
 
-    baseline = build_evaluation_setup_from_arrays(X, y, class_names, BENIGN, config, seed=0)
-    excluded = build_evaluation_setup_from_arrays(
-        X, y, class_names, BENIGN, config, seed=0, excluded_classes=frozenset({class_names.index("XSS")})
+    setup = build_evaluation_setup_from_arrays(
+        X, y, class_names, BENIGN, config, seed=0, excluded_classes=frozenset({holdout})
     )
 
-    np.testing.assert_array_equal(baseline.X_test_raw, excluded.X_test_raw)
-    np.testing.assert_array_equal(baseline.y_test, excluded.y_test)
+    assert holdout not in setup.y_test
+    for cid, data in setup.client_data.items():
+        np.testing.assert_allclose(setup.client_scalers[cid].mean_, data["X_raw"].mean(axis=0), rtol=1e-4, atol=1e-5)
 
 
 def test_benign_class_cannot_be_excluded(synthetic):
@@ -103,7 +106,9 @@ def test_autoencoder_backstop_catches_unseen_attacks_boosting_misses(zero_day_re
 def test_zero_day_reports_the_false_positive_cost(zero_day_results):
     # The backstop's price: it can only add flags, never remove them.
     assert (zero_day_results["cascade_benign_fpr"] >= zero_day_results["boosting_only_benign_fpr"]).all()
-    assert (zero_day_results["cascade_known_attack_recall"] >= zero_day_results["boosting_only_known_attack_recall"]).all()
+    assert (
+        zero_day_results["cascade_known_attack_macro_recall"] >= zero_day_results["boosting_only_known_attack_macro_recall"]
+    ).all()
 
 
 def test_zero_day_plot_saves_a_real_file(zero_day_results, tmp_path):

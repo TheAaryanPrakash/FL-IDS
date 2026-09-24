@@ -8,16 +8,16 @@ fl_ids.eval.ablation as scripts, checked separately.
 
 from __future__ import annotations
 
-from pathlib import Path
-
+import numpy as np
 import pytest
 
-from fl_ids.data.pipeline import partition_and_normalize_clients
 from fl_ids.data.synthetic import make_synthetic_attack_dataset
-from fl_ids.eval.ablation import run_ablation
-from fl_ids.eval.common import EvaluationSetup
-from fl_ids.eval.poisoning_sweep import plot_poisoning_sweep, run_poisoning_sweep
-from fl_ids.models.boosting import BoostingClassifier
+from fl_ids.eval.ablation import TABLE_COLUMNS, run_ablation
+from fl_ids.eval.common import EvaluationSetup, build_evaluation_setup_from_arrays
+from fl_ids.eval.metrics import detection_metrics
+from fl_ids.eval.poisoning_sweep import SWEEP_COLUMNS, plot_poisoning_sweep, run_poisoning_sweep
+from fl_ids.eval.poisoning_sweep import add_zero_day_column as add_sweep_zero_day
+from fl_ids.eval.variants import ABLATION_VARIANTS
 from fl_ids.utils.config import (
     AutoencoderConfig,
     BoostingConfig,
@@ -66,45 +66,34 @@ def _config(num_clients: int, poisoning_fractions: list[float]) -> Config:
 def _build_setup(seed: int, num_clients: int, poisoning_fractions: list[float]) -> tuple[Config, EvaluationSetup]:
     config = _config(num_clients, poisoning_fractions)
     X, y, class_names = make_synthetic_attack_dataset(n_samples=8000, n_features=12, seed=seed)
-
-    from sklearn.model_selection import train_test_split
-
-    X_calib, X_rest, y_calib, y_rest = train_test_split(X, y, train_size=0.1, random_state=seed, stratify=y)
-    X_pool, X_test, y_pool, y_test = train_test_split(X_rest, y_rest, test_size=0.2, random_state=seed, stratify=y_rest)
-
-    boosting_model = BoostingClassifier(
-        config.boosting, len(class_names), benign_class=0, seed=seed,
-        confidence_threshold=config.cascade.confidence_threshold,
-    )
-    boosting_model.train(X_calib, y_calib)
-
-    client_data = partition_and_normalize_clients(X_pool, y_pool, benign_class=0, config=config.data, seed=seed)
-
-    setup = EvaluationSetup(
-        client_data=client_data,
-        boosting_model=boosting_model,
-        class_names=class_names,
-        benign_class=0,
-        input_dim=X.shape[1],
-        X_test_raw=X_test,
-        X_test_norm=X_test,  # synthetic data is already roughly standardized; fine for this fast test
-        y_test=y_test,
-    )
+    setup = build_evaluation_setup_from_arrays(X, y, class_names, 0, config, seed)
     return config, setup
 
 
-def test_poisoning_sweep_runs_and_produces_expected_columns():
+def test_poisoning_sweep_scores_every_fraction_with_shared_detection_metrics():
     config, setup = _build_setup(seed=1, num_clients=5, poisoning_fractions=[0.0, 0.4])
     df = run_poisoning_sweep(setup, config, num_rounds=3, seed=1)
 
-    assert len(df) == 2
-    expected_cols = {
-        "malicious_fraction", "accuracy", "weighted_f1", "false_positive_rate",
-        "rounds_to_convergence", "total_communication_bytes", "final_val_loss",
-        "autoencoder_alone_attack_recall", "malicious_client_survival_rate",
-    }
-    assert expected_cols.issubset(df.columns)
-    assert (df["accuracy"] >= 0.0).all() and (df["accuracy"] <= 1.0).all()
+    assert list(df.columns) == SWEEP_COLUMNS
+    assert list(df["malicious_fraction"]) == [0.0, 0.4]
+    for col in ("attack_macro_recall", "benign_fpr", "autoencoder_alone_attack_macro_recall"):
+        assert df[col].between(0.0, 1.0).all(), col
+    assert np.isnan(df.loc[0, "malicious_client_survival_rate"])  # no attackers at 0%
+    assert df.loc[1, "malicious_client_survival_rate"] >= 0.0
+    assert df["zero_day_macro_recall"].isna().all()  # filled only by add_zero_day_column
+
+
+def test_poisoning_sweep_zero_day_column_is_filled(synthetic_for_zero_day):
+    X, y, class_names = synthetic_for_zero_day
+    config, setup = _build_setup(seed=1, num_clients=5, poisoning_fractions=[0.0, 0.4])
+    config.evaluation.zero_day_holdout_classes = ["Uploading"]
+    config.evaluation.zero_day_max_holdout_rows = 100
+    df = run_poisoning_sweep(setup, config, num_rounds=2, seed=1)
+
+    df, detail = add_sweep_zero_day(df, X, y, class_names, 0, config, num_rounds=2, seed=1)
+
+    assert df["zero_day_macro_recall"].between(0.0, 1.0).all()
+    assert len(detail) == 2 and set(detail["holdout_class"]) == {"Uploading"}
 
 
 def test_poisoning_sweep_plot_saves_a_real_file(tmp_path):
@@ -118,13 +107,34 @@ def test_poisoning_sweep_plot_saves_a_real_file(tmp_path):
     assert output_path.stat().st_size > 0
 
 
-def test_ablation_runs_and_produces_five_variants():
+def test_ablation_scores_all_five_variants_the_same_way():
     config, setup = _build_setup(seed=3, num_clients=5, poisoning_fractions=[0.3])
-    df = run_ablation(setup, config, num_rounds=3, poisoning_fraction=0.3, seed=3)
+    table, per_class = run_ablation(setup, config, num_rounds=3, poisoning_fraction=0.3, seed=3)
 
-    assert set(df["variant"]) == {
-        "full_pipeline", "plain_fedavg", "trimmed_mean_only", "autoencoder_only", "boosting_only",
-    }
-    assert (df["accuracy"] >= 0.0).all() and (df["accuracy"] <= 1.0).all()
-    # boosting_only does no FL training -- no communication cost.
-    assert df.loc[df["variant"] == "boosting_only", "total_communication_bytes"].iloc[0] == 0
+    assert list(table.columns) == TABLE_COLUMNS
+    assert list(table["variant"]) == [v.name for v in ABLATION_VARIANTS]
+    assert table["attack_macro_recall"].between(0.0, 1.0).all()
+    assert table["benign_fpr"].between(0.0, 1.0).all()
+    boosting_only = table.set_index("variant").loc["boosting_only"]
+    # No FL training -- no communication cost, no autoencoder to report on.
+    assert boosting_only["total_communication_bytes"] == 0
+    assert np.isnan(boosting_only["autoencoder_alone_attack_macro_recall"])
+    # One recall per (variant, attack type present in the test set).
+    n_attack_types = len(set(setup.y_test) - {setup.benign_class})
+    assert len(per_class) == len(ABLATION_VARIANTS) * n_attack_types
+
+
+def test_boosting_only_row_uses_the_cascade_confidence_rule_not_argmax():
+    config, setup = _build_setup(seed=3, num_clients=5, poisoning_fractions=[0.3])
+    table, _ = run_ablation(setup, config, num_rounds=2, poisoning_fraction=0.3, seed=3)
+
+    stage1 = setup.boosting_model.predict_cascade_stage1(setup.X_test_raw)
+    expected = detection_metrics(stage1.is_confident_attack, setup.y_test, setup.benign_class, setup.class_names)
+    row = table.set_index("variant").loc["boosting_only"]
+    assert row["attack_macro_recall"] == pytest.approx(expected["attack_macro_recall"])
+    assert row["benign_fpr"] == pytest.approx(expected["benign_fpr"])
+
+
+@pytest.fixture(scope="module")
+def synthetic_for_zero_day():
+    return make_synthetic_attack_dataset(n_samples=8000, n_features=12, seed=1)

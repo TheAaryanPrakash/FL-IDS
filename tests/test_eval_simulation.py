@@ -81,7 +81,7 @@ def test_simulation_trust_filtered_runs_and_reduces_loss():
     assert len(result.rounds) == 5
     assert result.rounds[-1].mean_val_loss < result.rounds[0].mean_val_loss
     assert result.total_communication_bytes > 0
-    assert 1 <= result.rounds_to_convergence <= 5
+    assert 1 <= result.rounds_to_convergence(tolerance=0.1) <= 5
     assert result.rounds[0].trust_scores is not None
 
 

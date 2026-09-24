@@ -14,6 +14,15 @@ doesn't have one coherent continuous score to build a ROC curve from
 on different scales for different subsets of samples), so cascade-level
 results report accuracy/precision/recall/F1/FPR only — a deliberate
 scope decision, not an oversight.
+
+**Comparing variants** (ablation, poisoning sweep, zero-day) uses one
+shared binary framing instead: `flag_attacks` turns any variant into a
+per-row "flagged as attack or not" decision, and `detection_metrics`
+computes the same numbers from those flags for every variant. Attack
+macro-recall (mean per-attack-type detection rate) is the headline, not
+accuracy: ~71% of traffic is benign, so accuracy mostly measures the
+benign false-positive rate and can *rise* as a broken autoencoder stops
+flagging anything.
 """
 
 from __future__ import annotations
@@ -114,7 +123,7 @@ def evaluate_boosting_alone(
 
 def evaluate_autoencoder_alone(
     autoencoder: Autoencoder,
-    anomaly_threshold: float,
+    anomaly_threshold: float | np.ndarray,
     X_normalized: np.ndarray,
     y_true: np.ndarray,
     benign_class: int,
@@ -126,7 +135,8 @@ def evaluate_autoencoder_alone(
 
     Args:
         autoencoder: Trained autoencoder.
-        anomaly_threshold: Calibrated benign reconstruction-error threshold.
+        anomaly_threshold: Calibrated benign reconstruction-error threshold,
+            one value or one per row.
         X_normalized: Per-client-normalized features.
         y_true: True integer class labels.
         benign_class: Integer class index corresponding to "Normal".
@@ -141,7 +151,7 @@ def evaluate_autoencoder_alone(
     precision, recall, f1, support = precision_recall_fscore_support(
         y_true_binary, y_pred_binary, average=None, zero_division=0, labels=[0, 1]
     )
-    if 0 < y_true_binary.sum() < len(y_true_binary) and np.isfinite(anomaly_threshold):
+    if 0 < y_true_binary.sum() < len(y_true_binary) and np.isfinite(anomaly_threshold).any():
         auroc = [roc_auc_score(y_true_binary, errors)] * 2
     else:
         auroc = [float("nan")] * 2
@@ -178,7 +188,7 @@ def evaluate_autoencoder_alone(
 def evaluate_cascade(
     boosting_model: BoostingClassifier,
     autoencoder: Autoencoder,
-    anomaly_threshold: float,
+    anomaly_threshold: float | np.ndarray,
     X_raw: np.ndarray,
     X_normalized: np.ndarray,
     y_true: np.ndarray,
@@ -253,6 +263,94 @@ def evaluate_cascade(
         false_positive_rate=_false_positive_rate(y_true_binary, y_pred_binary),
         extra={"per_label": per_label_df, "stage_counts": stage_counts},
     )
+
+
+DETECTION_MODES = ("cascade", "boosting_only", "autoencoder_only")
+
+
+def flag_attacks(
+    mode: str,
+    boosting_model: BoostingClassifier | None,
+    autoencoder: Autoencoder | None,
+    anomaly_threshold: float | np.ndarray | None,
+    X_raw: np.ndarray,
+    X_normalized: np.ndarray,
+    class_names: list[str],
+    cascade_config: CascadeConfig,
+) -> np.ndarray:
+    """Per-row "flagged as an attack" decision for one pipeline variant.
+
+    - `"cascade"`: the full decision rule; flagged unless the final label is benign.
+    - `"boosting_only"`: the cascade with no autoencoder backstop — flagged
+      iff boosting makes a confident known-attack call (the same rule the
+      cascade uses), everything else benign. Not boosting's bare argmax,
+      which ignores the confidence threshold the deployed system applies.
+    - `"autoencoder_only"`: no boosting at all — flagged iff reconstruction
+      error exceeds the threshold.
+
+    Args:
+        mode: One of `DETECTION_MODES`.
+        boosting_model: Needed for `"cascade"` and `"boosting_only"`.
+        autoencoder: Needed for `"cascade"` and `"autoencoder_only"`.
+        anomaly_threshold: One value or one per row; needed with an autoencoder.
+        X_raw: Raw-scale features (boosting's input).
+        X_normalized: Per-client-normalized features (the autoencoder's input).
+        class_names: Class names in class-index order.
+        cascade_config: Cascade decision rule config.
+
+    Returns:
+        Boolean array, one entry per row.
+    """
+    if mode == "cascade":
+        output = cascade_predict(
+            boosting_model, autoencoder, anomaly_threshold, X_raw, X_normalized, class_names, cascade_config
+        )
+        return output.predicted_label != BENIGN_LABEL
+    if mode == "boosting_only":
+        return boosting_model.predict_cascade_stage1(X_raw).is_confident_attack
+    if mode == "autoencoder_only":
+        return reconstruction_error(autoencoder, X_normalized) > np.asarray(anomaly_threshold)
+    raise ValueError(f"Unknown detection mode {mode!r}; expected one of {DETECTION_MODES}")
+
+
+def detection_metrics(
+    flags: np.ndarray, y_true: np.ndarray, benign_class: int, class_names: list[str]
+) -> dict:
+    """Benign-vs-attack detection metrics from per-row flags — the same numbers for every variant.
+
+    Args:
+        flags: `flag_attacks` output.
+        y_true: True integer class labels.
+        benign_class: Integer class index corresponding to "Normal".
+        class_names: Class names in class-index order.
+
+    Returns:
+        `attack_macro_recall` (mean over attack types present of the
+        fraction flagged — every type counts equally, however rare),
+        `attack_micro_recall` (fraction of all attack rows flagged),
+        `benign_fpr`, `detection_f1` (binary F1 on the attack class), and
+        `per_class_recall` ({attack type: fraction flagged}).
+    """
+    flags = np.asarray(flags, dtype=bool)
+    is_attack = y_true != benign_class
+    per_class_recall = {
+        class_names[c]: float(flags[y_true == c].mean())
+        for c in np.unique(y_true)
+        if c != benign_class
+    }
+    true_positives = int((flags & is_attack).sum())
+    flagged = int(flags.sum())
+    attacks = int(is_attack.sum())
+    precision = true_positives / flagged if flagged else 0.0
+    recall = true_positives / attacks if attacks else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "attack_macro_recall": float(np.mean(list(per_class_recall.values()))) if per_class_recall else float("nan"),
+        "attack_micro_recall": recall if attacks else float("nan"),
+        "benign_fpr": float(flags[~is_attack].mean()) if (~is_attack).any() else float("nan"),
+        "detection_f1": f1,
+        "per_class_recall": per_class_recall,
+    }
 
 
 def stage_report_summary(report: StageReport) -> dict:

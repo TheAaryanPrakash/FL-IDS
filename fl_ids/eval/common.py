@@ -1,16 +1,25 @@
-"""Shared setup for Phase 6's evaluation sweeps (poisoning resistance, ablation).
+"""Shared setup for Phase 6's evaluation sweeps (poisoning resistance, ablation, zero-day).
 
-Both sweeps need the same ingredients — a server-held calibration set, a
+Every sweep needs the same ingredients — a server-held calibration set, a
 bootstrap boosting model, per-client federated data, and a held-out test
 set — built once and reused across every sweep point/ablation variant so
 results are comparable (same data, same seed, per CLAUDE.md's ablation
 requirement).
+
+**Evaluation is per client, like deployment.** Each client normalizes its
+own traffic with a scaler fit on its own training rows (component 1) and
+calibrates its own anomaly threshold on its own benign validation slice
+(component 3). The test set is therefore the union of the clients' own
+held-out test slices, each row normalized with its client's scaler and
+scored against that client's threshold — never one client's scaler
+applied to everyone, or a threshold pooled across differently-normalized
+data (which is what an earlier version did, mixing the two scales).
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -27,6 +36,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class EvaluationSetup:
+    """Everything a sweep point needs, shared across variants.
+
+    `X_test_raw`/`X_test_norm`/`y_test`/`test_client_ids` are the clients'
+    own test slices concatenated, row-aligned: row i came from client
+    `test_client_ids[i]` and was normalized with that client's scaler.
+    """
+
     client_data: dict[int, dict[str, np.ndarray]]
     boosting_model: BoostingClassifier
     class_names: list[str]
@@ -35,14 +51,33 @@ class EvaluationSetup:
     X_test_raw: np.ndarray
     X_test_norm: np.ndarray
     y_test: np.ndarray
-    # The scaler that produced X_test_norm, so rows evaluated outside the
-    # shared test set (e.g. the zero-day experiment's held-out attack rows)
-    # get normalized identically. None where the caller built the setup by
-    # hand with already-normalized data.
-    test_scaler: StandardScaler | None = None
+    test_client_ids: np.ndarray
+    # Each client's scaler, so rows from outside its data (the zero-day
+    # experiment's held-out attack rows) are normalized the way that
+    # client would normalize them.
+    client_scalers: dict[int, StandardScaler] = field(default_factory=dict)
     # Classes removed from the calibration set and the federated pool
     # before training (the zero-day experiment's "never seen" attack types).
     excluded_classes: frozenset[int] = frozenset()
+
+
+def concat_client_test_slices(
+    client_data: dict[int, dict[str, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Concatenate every client's own test slice into one row-aligned test set.
+
+    Args:
+        client_data: Component 1's per-client output.
+
+    Returns:
+        (X_test_raw, X_test_norm, y_test, test_client_ids).
+    """
+    ids = sorted(client_data)
+    X_raw = np.concatenate([client_data[cid]["X_test_raw"] for cid in ids]).astype(np.float32)
+    X_norm = np.concatenate([client_data[cid]["X_test"] for cid in ids]).astype(np.float32)
+    y = np.concatenate([client_data[cid]["y_test"] for cid in ids])
+    client_ids = np.concatenate([np.full(len(client_data[cid]["y_test"]), cid) for cid in ids])
+    return X_raw, X_norm, y, client_ids
 
 
 def build_evaluation_setup(
@@ -91,11 +126,9 @@ def build_evaluation_setup_from_arrays(
 
     `excluded_classes` supports the zero-day experiment: those classes are
     dropped from the calibration set (so boosting never learns them) and
-    from the federated pool (so no client ever holds them, and the
-    autoencoder never trains on them). The removal happens *after* every
-    split, so the held-out test set is exactly the one an exclusion-free
-    setup with the same seed produces — every held-out-class run is scored
-    against the same benign/known-attack test rows.
+    from the federated pool before partitioning (so no client ever holds
+    them — not in training data, not in its scaler's statistics, not in
+    its test slice).
 
     Args:
         X: Full raw-scale feature matrix (`load_and_encode` output).
@@ -110,7 +143,7 @@ def build_evaluation_setup_from_arrays(
 
     Returns:
         An `EvaluationSetup` with the calibration-trained boosting model,
-        per-client federated data, and a held-out test set.
+        per-client federated data, and the clients' concatenated test slices.
 
     Raises:
         ValueError: If `excluded_classes` contains the benign class.
@@ -126,14 +159,6 @@ def build_evaluation_setup_from_arrays(
         X_pool, _, y_pool, _ = train_test_split(
             X_pool, y_pool, train_size=pool_subsample_size, random_state=seed, stratify=y_pool
         )
-
-    # A held-out test set, disjoint from both calibration and the
-    # federated pool (drawn from the same pool split before per-client
-    # partitioning, mirroring build_server_and_federated_dataset's
-    # disjointness-by-construction).
-    X_pool, X_test_raw, y_pool, y_test = train_test_split(
-        X_pool, y_pool, test_size=0.15, random_state=seed, stratify=y_pool
-    )
 
     if excluded_classes:
         excluded = np.array(sorted(excluded_classes))
@@ -159,19 +184,22 @@ def build_evaluation_setup_from_arrays(
     boosting_model.train(X_calib, y_calib)
 
     client_data = partition_and_normalize_clients(X_pool, y_pool, benign_class, config.data, seed)
-
-    # Normalize the held-out test set the same way every client normalizes
-    # its own data (its own scaler) -- for cascade/autoencoder evaluation,
-    # any one client's scaler is as good as another's for this purpose, so
-    # we use client 0's, applied consistently across the whole test set.
-    ref_scaler = StandardScaler().fit(client_data[0]["X_raw"])
-    X_test_norm = ref_scaler.transform(X_test_raw).astype(np.float32)
+    # Refit on each client's raw training rows: the exact scaler
+    # partition_and_normalize_clients fit and applied (StandardScaler is
+    # deterministic), kept for normalizing rows from outside the client.
+    client_scalers = {
+        cid: StandardScaler().fit(data["X_raw"])
+        for cid, data in client_data.items()
+        if config.data.normalize_per_client and len(data["X_raw"]) > 0
+    }
+    X_test_raw, X_test_norm, y_test, test_client_ids = concat_client_test_slices(client_data)
 
     logger.info(
-        "Evaluation setup: %d calibration, %d federated pool (subsampled), %d test rows",
+        "Evaluation setup: %d calibration, %d federated pool (subsampled), %d test rows across %d clients",
         len(X_calib),
         len(X_pool),
-        len(X_test_raw),
+        len(y_test),
+        len(client_data),
     )
 
     return EvaluationSetup(
@@ -180,38 +208,99 @@ def build_evaluation_setup_from_arrays(
         class_names=class_names,
         benign_class=benign_class,
         input_dim=X.shape[1],
-        X_test_raw=X_test_raw.astype(np.float32),
+        X_test_raw=X_test_raw,
         X_test_norm=X_test_norm,
         y_test=y_test,
-        test_scaler=ref_scaler,
+        test_client_ids=test_client_ids,
+        client_scalers=client_scalers,
         excluded_classes=frozenset(excluded_classes),
     )
 
 
-def calibrate_threshold_from_final_weights(
+def calibrate_client_thresholds(
     final_weights: list[np.ndarray],
     setup: EvaluationSetup,
     config: Config,
-) -> tuple[Autoencoder, float]:
-    """Load simulation output weights into a fresh Autoencoder and calibrate its threshold.
+) -> tuple[Autoencoder, dict[int, float]]:
+    """Load final global weights and calibrate each client's own anomaly threshold.
+
+    Mirrors what each client does after every FL round (component 3,
+    `AutoencoderClient.evaluate`): the configured percentile of
+    reconstruction error on its own benign validation slice. A client with
+    no benign validation rows gets an infinite threshold, exactly as it
+    does during training — so it never flags anything, and that cost shows
+    up in the metrics rather than being papered over by a pooled fallback.
 
     Args:
         final_weights: The simulation's final global autoencoder weights.
-        setup: The shared `EvaluationSetup` (for input_dim and client val_benign data).
+        setup: The shared `EvaluationSetup`.
         config: Full project config (autoencoder architecture, anomaly percentile).
 
     Returns:
-        (autoencoder, anomaly_threshold), ready for cascade/standalone evaluation.
+        (autoencoder, {client_id: threshold}).
     """
     autoencoder = Autoencoder(setup.input_dim, config.autoencoder.hidden_dims, config.autoencoder.bottleneck_dim)
     set_weights(autoencoder, final_weights)
 
-    val_benign = np.concatenate(
-        [data["X_val_benign"] for data in setup.client_data.values() if len(data["X_val_benign"]) > 0]
-    )
-    errors = reconstruction_error(autoencoder, val_benign)
-    threshold = compute_anomaly_threshold(errors, config.autoencoder.anomaly_percentile)
-    return autoencoder, threshold
+    thresholds = {}
+    for cid, data in setup.client_data.items():
+        if len(data["X_val_benign"]) == 0:
+            thresholds[cid] = float("inf")
+            continue
+        errors = reconstruction_error(autoencoder, data["X_val_benign"])
+        thresholds[cid] = compute_anomaly_threshold(errors, config.autoencoder.anomaly_percentile)
+
+    uncalibrated = [cid for cid, t in thresholds.items() if not np.isfinite(t)]
+    if uncalibrated:
+        affected = int(np.isin(setup.test_client_ids, uncalibrated).sum())
+        logger.warning(
+            "Clients %s have no benign validation rows (infinite threshold); %d test rows can't be flagged "
+            "by the autoencoder", uncalibrated, affected,
+        )
+    return autoencoder, thresholds
+
+
+def per_row_thresholds(thresholds: dict[int, float], client_ids: np.ndarray) -> np.ndarray:
+    """Expand `{client_id: threshold}` to one threshold per row.
+
+    Args:
+        thresholds: `calibrate_client_thresholds` output.
+        client_ids: Which client each row belongs to.
+
+    Returns:
+        Float array aligned with `client_ids`.
+    """
+    return np.array([thresholds[cid] for cid in client_ids], dtype=np.float64)
+
+
+def assign_rows_to_clients(
+    setup: EvaluationSetup, X_raw: np.ndarray, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Spread rows from outside the federation across clients, normalizing each with its client's scaler.
+
+    Used for the zero-day experiment's held-out attack rows, which belong
+    to no client: each row is scored as if it appeared in one client's
+    traffic, with clients assigned uniformly at random so a novel attack
+    shows up everywhere rather than only at one client.
+
+    Args:
+        setup: The evaluation setup (its clients and `client_scalers`).
+        X_raw: Raw-scale rows to assign.
+        seed: Random seed for the assignment.
+
+    Returns:
+        (X_norm, client_ids), row-aligned with `X_raw`.
+    """
+    client_ids_available = np.array(sorted(setup.client_data))
+    client_ids = np.random.default_rng(seed).choice(client_ids_available, size=len(X_raw))
+    # Clients without a scaler (normalize_per_client off, or no training
+    # rows) see raw features, as they do during training.
+    X_norm = X_raw.astype(np.float32, copy=True)
+    for cid, scaler in setup.client_scalers.items():
+        rows = client_ids == cid
+        if rows.any():
+            X_norm[rows] = scaler.transform(X_raw[rows])
+    return X_norm, client_ids
 
 
 def select_malicious_clients(client_ids: list[int], fraction: float, seed: int) -> set[int]:

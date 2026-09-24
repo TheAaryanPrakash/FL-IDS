@@ -59,7 +59,7 @@ class CascadeOutput:
 def cascade_predict(
     boosting_model: BoostingClassifier,
     autoencoder: Autoencoder,
-    anomaly_threshold: float,
+    anomaly_threshold: float | np.ndarray,
     X_raw: np.ndarray,
     X_normalized: np.ndarray,
     class_names: list[str],
@@ -71,7 +71,10 @@ def cascade_predict(
         boosting_model: Trained boosting classifier (cascade stage 1).
         autoencoder: Trained autoencoder (cascade stage 2).
         anomaly_threshold: The calibrated benign reconstruction-error
-            threshold (see `fl_ids.models.autoencoder.compute_anomaly_threshold`).
+            threshold (see `fl_ids.models.autoencoder.compute_anomaly_threshold`),
+            either one value for every sample or one per sample -- e.g. when
+            each row comes from a different client, scored against that
+            client's own threshold.
         X_raw: Raw-scale features (what boosting consumes), shape
             (n_samples, n_features).
         X_normalized: Per-client-normalized features (what the
@@ -98,15 +101,13 @@ def cascade_predict(
     fallthrough_mask = ~confident_mask
     if fallthrough_mask.any():
         errors = reconstruction_error(autoencoder, X_normalized[fallthrough_mask])
-        is_anomalous = errors > anomaly_threshold
+        thresholds = np.broadcast_to(np.asarray(anomaly_threshold, dtype=np.float64), (n,))[fallthrough_mask]
+        is_anomalous = errors > thresholds
 
         clip_low, clip_high = cascade_config.anomaly_confidence_clip
-        anomaly_confidence = np.clip(
-            np.divide(errors, anomaly_threshold, out=np.full_like(errors, np.inf), where=anomaly_threshold > 0) - 1.0,
-            clip_low,
-            clip_high,
-        )
-        benign_confidence = 1.0 - np.clip(errors / anomaly_threshold if anomaly_threshold > 0 else 0.0, 0.0, 1.0)
+        ratio = np.divide(errors, thresholds, out=np.full(errors.shape, np.inf), where=thresholds > 0)
+        anomaly_confidence = np.clip(ratio - 1.0, clip_low, clip_high)
+        benign_confidence = 1.0 - np.clip(np.where(thresholds > 0, ratio, 0.0), 0.0, 1.0)
 
         fallthrough_indices = np.where(fallthrough_mask)[0]
         for local_i, global_i in enumerate(fallthrough_indices):

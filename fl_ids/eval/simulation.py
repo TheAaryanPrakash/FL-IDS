@@ -58,15 +58,31 @@ class SimulationResult:
     def total_communication_bytes(self) -> int:
         return sum(r.communication_bytes for r in self.rounds)
 
-    @property
-    def rounds_to_convergence(self) -> int:
-        """First round whose val loss is within 10% of the best ever achieved."""
-        losses = [r.mean_val_loss for r in self.rounds]
-        best = min(losses)
-        for i, loss in enumerate(losses):
-            if loss <= best * 1.1:
-                return i + 1
-        return len(losses)
+    def rounds_to_convergence(self, tolerance: float) -> float:
+        """First round after which validation loss stays within `tolerance` of its best; NaN if it never settles.
+
+        A run counts as converged only if it *ends* within the band
+        (loss <= best * (1 + tolerance)). A run that diverges — e.g. plain
+        FedAvg under poisoning, whose loss is lowest in round 1 and then
+        explodes — reports NaN rather than "converged in round 1".
+
+        Args:
+            tolerance: Relative band around the best loss
+                (`evaluation.convergence_tolerance`).
+
+        Returns:
+            A 1-based round number, or NaN.
+        """
+        losses = np.array([r.mean_val_loss for r in self.rounds], dtype=np.float64)
+        if len(losses) == 0 or not np.isfinite(losses[-1]):
+            return float("nan")
+        band = np.nanmin(losses) * (1 + tolerance)
+        within = np.isfinite(losses) & (losses <= band)
+        if not within[-1]:
+            return float("nan")
+        # Last round outside the band; convergence starts right after it.
+        outside = np.where(~within)[0]
+        return float(outside[-1] + 2) if len(outside) else 1.0
 
 
 def _make_clients(

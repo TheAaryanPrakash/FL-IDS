@@ -47,12 +47,13 @@ from sklearn.metrics import roc_auc_score
 
 from fl_ids.eval.common import (
     EvaluationSetup,
+    assign_rows_to_clients,
     build_evaluation_setup_from_arrays,
-    calibrate_threshold_from_final_weights,
+    select_malicious_clients,
 )
-from fl_ids.eval.simulation import run_simulated_fl_training
-from fl_ids.models.autoencoder import Autoencoder, reconstruction_error
-from fl_ids.models.cascade import ANOMALOUS_LABEL, BENIGN_LABEL, cascade_predict
+from fl_ids.eval.metrics import detection_metrics
+from fl_ids.eval.variants import FULL_PIPELINE, TrainedVariant, Variant, flag_rows, train_variant
+from fl_ids.models.autoencoder import reconstruction_error
 from fl_ids.utils.config import Config
 
 logger = logging.getLogger(__name__)
@@ -85,23 +86,38 @@ def resolve_holdout_classes(configured: list[str], class_names: list[str], benig
     return indices
 
 
+def sample_holdout_rows(y: np.ndarray, holdout_class: int, max_rows: int, seed: int) -> np.ndarray:
+    """Indices of the held-out class's rows to score, capped at `max_rows`.
+
+    Seeded per class, so a class's rows don't depend on which other
+    classes ran before it.
+    """
+    idx = np.where(y == holdout_class)[0]
+    if len(idx) > max_rows:
+        idx = np.sort(np.random.default_rng([seed, holdout_class]).choice(idx, max_rows, replace=False))
+    return idx
+
+
 def evaluate_zero_day_holdout(
     setup: EvaluationSetup,
-    autoencoder: Autoencoder,
-    anomaly_threshold: float,
+    trained: TrainedVariant,
     X_holdout_raw: np.ndarray,
     config: Config,
+    seed: int,
 ) -> dict:
-    """Score one trained cascade against a held-out (never-trained-on) attack class.
+    """Score one trained cascade stage by stage against a held-out (never-trained-on) attack class.
+
+    Held-out rows belong to no client, so each is assigned to a random
+    client and scored the way that client would score it: its scaler, its
+    threshold (`assign_rows_to_clients`).
 
     Args:
         setup: The evaluation setup the models were trained from; its
-            `excluded_classes` must contain exactly the held-out class, and
-            its `test_scaler` normalizes the held-out rows.
-        autoencoder: The FL-trained global autoencoder.
-        anomaly_threshold: Its calibrated benign threshold.
+            `excluded_classes` must contain exactly the held-out class.
+        trained: The trained cascade (`train_variant(FULL_PIPELINE, ...)`).
         X_holdout_raw: Raw-scale rows of the held-out attack class.
         config: Full project config (cascade decision rule).
+        seed: Random seed for assigning held-out rows to clients.
 
     Returns:
         A flat dict of held-out detection rates and shared-test-set costs
@@ -109,36 +125,32 @@ def evaluate_zero_day_holdout(
     """
     if len(setup.excluded_classes) != 1:
         raise ValueError("evaluate_zero_day_holdout expects a setup with exactly one excluded class")
-    if setup.test_scaler is None:
-        raise ValueError("setup.test_scaler is required to normalize held-out rows like the test set")
     (holdout_class,) = setup.excluded_classes
 
-    X_holdout_norm = setup.test_scaler.transform(X_holdout_raw).astype(np.float32)
-    holdout = cascade_predict(
-        setup.boosting_model, autoencoder, anomaly_threshold, X_holdout_raw, X_holdout_norm,
-        setup.class_names, config.cascade,
-    )
-    by_boosting = holdout.stage == "boosting"
-    by_autoencoder = (holdout.stage == "autoencoder") & (holdout.predicted_label == ANOMALOUS_LABEL)
-    holdout_errors = reconstruction_error(autoencoder, X_holdout_norm)
+    X_holdout_norm, holdout_clients = assign_rows_to_clients(setup, X_holdout_raw, seed)
 
-    misattributed = pd.Series(holdout.predicted_label[by_boosting]).value_counts()
-    top_label = str(misattributed.index[0]) if len(misattributed) else ""
-    top_share = float(misattributed.iloc[0] / len(X_holdout_raw)) if len(misattributed) else 0.0
+    def _flags(X_raw, X_norm, clients, mode):
+        return flag_rows(trained, setup, X_raw, X_norm, clients, config, mode=mode)
 
-    # Costs on the shared test set, leaving out its handful of held-out-class
-    # rows (already counted above, among all of that class's rows).
-    keep = setup.y_test != holdout_class
-    y_test = setup.y_test[keep]
-    shared = cascade_predict(
-        setup.boosting_model, autoencoder, anomaly_threshold, setup.X_test_raw[keep], setup.X_test_norm[keep],
-        setup.class_names, config.cascade,
-    )
-    is_benign = y_test == setup.benign_class
-    boosting_flags = shared.stage == "boosting"
-    cascade_flags = shared.predicted_label != BENIGN_LABEL
+    holdout = {
+        mode: _flags(X_holdout_raw, X_holdout_norm, holdout_clients, mode)
+        for mode in ("boosting_only", "autoencoder_only", "cascade")
+    }
+    confident = setup.boosting_model.predict_cascade_stage1(X_holdout_raw)
+    misattributed = pd.Series(
+        np.array(setup.class_names, dtype=object)[confident.predicted_class[confident.is_confident_attack]]
+    ).value_counts()
 
-    benign_errors = reconstruction_error(autoencoder, setup.X_test_norm[keep][is_benign])
+    test = {
+        mode: detection_metrics(
+            _flags(setup.X_test_raw, setup.X_test_norm, setup.test_client_ids, mode),
+            setup.y_test, setup.benign_class, setup.class_names,
+        )
+        for mode in ("boosting_only", "cascade")
+    }
+
+    holdout_errors = reconstruction_error(trained.autoencoder, X_holdout_norm)
+    benign_errors = reconstruction_error(trained.autoencoder, setup.X_test_norm[setup.y_test == setup.benign_class])
     scores = np.concatenate([benign_errors, holdout_errors])
     labels = np.concatenate([np.zeros(len(benign_errors)), np.ones(len(holdout_errors))])
     autoencoder_auroc = float(roc_auc_score(labels, scores)) if np.isfinite(scores).all() else float("nan")
@@ -146,18 +158,19 @@ def evaluate_zero_day_holdout(
     return {
         "holdout_class": setup.class_names[holdout_class],
         "holdout_rows": len(X_holdout_raw),
-        "boosting_only_detection_rate": float(by_boosting.mean()),
-        "autoencoder_alone_detection_rate": float((holdout_errors > anomaly_threshold).mean()),
-        "cascade_detection_rate": float((holdout.predicted_label != BENIGN_LABEL).mean()),
-        "autoencoder_added_detection_rate": float(by_autoencoder.mean()),
-        "boosting_top_misattributed_label": top_label,
-        "boosting_top_misattributed_share": top_share,
+        "boosting_only_detection_rate": float(holdout["boosting_only"].mean()),
+        "autoencoder_alone_detection_rate": float(holdout["autoencoder_only"].mean()),
+        "cascade_detection_rate": float(holdout["cascade"].mean()),
+        # The autoencoder only sees what boosting let through, so the
+        # cascade's detections are exactly boosting's plus these.
+        "autoencoder_added_detection_rate": float((holdout["cascade"] & ~holdout["boosting_only"]).mean()),
+        "boosting_top_misattributed_label": str(misattributed.index[0]) if len(misattributed) else "",
+        "boosting_top_misattributed_share": float(misattributed.iloc[0] / len(X_holdout_raw)) if len(misattributed) else 0.0,
         "autoencoder_auroc_vs_benign": autoencoder_auroc,
-        "boosting_only_benign_fpr": float(boosting_flags[is_benign].mean()),
-        "cascade_benign_fpr": float(cascade_flags[is_benign].mean()),
-        "boosting_only_known_attack_recall": float(boosting_flags[~is_benign].mean()),
-        "cascade_known_attack_recall": float(cascade_flags[~is_benign].mean()),
-        "anomaly_threshold": float(anomaly_threshold),
+        "boosting_only_benign_fpr": test["boosting_only"]["benign_fpr"],
+        "cascade_benign_fpr": test["cascade"]["benign_fpr"],
+        "boosting_only_known_attack_macro_recall": test["boosting_only"]["attack_macro_recall"],
+        "cascade_known_attack_macro_recall": test["cascade"]["attack_macro_recall"],
     }
 
 
@@ -173,6 +186,9 @@ def run_zero_day_experiment(
 ) -> pd.DataFrame:
     """Run the leave-one-attack-class-out experiment over every configured holdout class.
 
+    Trains the full pipeline with no malicious clients per holdout, and
+    breaks detection down by cascade stage.
+
     Args:
         X: Full raw-scale feature matrix (`load_and_encode` output).
         y: Integer class labels.
@@ -181,42 +197,81 @@ def run_zero_day_experiment(
         config: Full project config (`evaluation.zero_day_*` picks the
             holdout classes and the per-class row cap).
         num_rounds: FL rounds per holdout run.
-        seed: Random seed (splits, partitioning, model init, row subsampling).
+        seed: Random seed (splits, partitioning, model init, row sampling).
         pool_subsample_size: Caps the federated-client pool size.
 
     Returns:
         One row per held-out class (see `evaluate_zero_day_holdout`).
     """
-    holdout_classes = resolve_holdout_classes(config.evaluation.zero_day_holdout_classes, class_names, benign_class)
-    rng = np.random.default_rng(seed)
     rows = []
-
-    for holdout_class in holdout_classes:
+    for holdout_class in resolve_holdout_classes(config.evaluation.zero_day_holdout_classes, class_names, benign_class):
         name = class_names[holdout_class]
         logger.info("Zero-day run: holding out %s", name)
         setup = build_evaluation_setup_from_arrays(
             X, y, class_names, benign_class, config, seed, pool_subsample_size,
             excluded_classes=frozenset({holdout_class}),
         )
-        result = run_simulated_fl_training(
-            setup.client_data, setup.boosting_model, len(class_names), benign_class, config,
-            num_rounds=num_rounds, aggregation="trust_filtered", seed=seed,
-        )
-        autoencoder, threshold = calibrate_threshold_from_final_weights(result.final_weights, setup, config)
-
-        holdout_idx = np.where(y == holdout_class)[0]
-        if len(holdout_idx) > config.evaluation.zero_day_max_holdout_rows:
-            holdout_idx = np.sort(rng.choice(holdout_idx, config.evaluation.zero_day_max_holdout_rows, replace=False))
-
-        row = evaluate_zero_day_holdout(setup, autoencoder, threshold, X[holdout_idx], config)
-        row["final_val_loss"] = result.rounds[-1].mean_val_loss
+        trained = train_variant(FULL_PIPELINE, setup, config, num_rounds, set(), seed)
+        holdout_idx = sample_holdout_rows(y, holdout_class, config.evaluation.zero_day_max_holdout_rows, seed)
+        row = evaluate_zero_day_holdout(setup, trained, X[holdout_idx], config, seed)
+        row["final_val_loss"] = trained.simulation.rounds[-1].mean_val_loss
         rows.append(row)
         logger.info(
             "holdout=%s: boosting_only=%.3f autoencoder_alone=%.3f cascade=%.3f (benign FPR %.4f -> %.4f)",
             name, row["boosting_only_detection_rate"], row["autoencoder_alone_detection_rate"],
             row["cascade_detection_rate"], row["boosting_only_benign_fpr"], row["cascade_benign_fpr"],
         )
+    return pd.DataFrame(rows)
 
+
+def zero_day_detection_by_run(
+    runs: list[tuple[str, Variant, float]],
+    X: np.ndarray,
+    y: np.ndarray,
+    class_names: list[str],
+    benign_class: int,
+    config: Config,
+    num_rounds: int,
+    seed: int,
+    pool_subsample_size: int = 60_000,
+) -> pd.DataFrame:
+    """Held-out-attack detection rate for several pipeline variants, one row per (run, holdout class).
+
+    The ablation and poisoning sweep use this for their zero-day column:
+    for each holdout class, one setup is built and shared by every run, so
+    runs differ only in the variant and poisoning fraction.
+
+    Args:
+        runs: `(label, variant, malicious_fraction)` per run.
+        X: Full raw-scale feature matrix.
+        y: Integer class labels.
+        class_names: Class names in class-index order.
+        benign_class: Integer class index corresponding to "Normal".
+        config: Full project config (`evaluation.zero_day_*`).
+        num_rounds: FL rounds per training.
+        seed: Random seed.
+        pool_subsample_size: Caps the federated-client pool size.
+
+    Returns:
+        Columns `run`, `holdout_class`, `detection_rate`.
+    """
+    rows = []
+    for holdout_class in resolve_holdout_classes(config.evaluation.zero_day_holdout_classes, class_names, benign_class):
+        name = class_names[holdout_class]
+        setup = build_evaluation_setup_from_arrays(
+            X, y, class_names, benign_class, config, seed, pool_subsample_size,
+            excluded_classes=frozenset({holdout_class}),
+        )
+        holdout_idx = sample_holdout_rows(y, holdout_class, config.evaluation.zero_day_max_holdout_rows, seed)
+        X_holdout_raw = X[holdout_idx]
+        X_holdout_norm, holdout_clients = assign_rows_to_clients(setup, X_holdout_raw, seed)
+        client_ids = list(setup.client_data)
+        for label, variant, fraction in runs:
+            malicious = select_malicious_clients(client_ids, fraction, seed)
+            trained = train_variant(variant, setup, config, num_rounds, malicious, seed)
+            rate = float(flag_rows(trained, setup, X_holdout_raw, X_holdout_norm, holdout_clients, config).mean())
+            rows.append({"run": label, "holdout_class": name, "detection_rate": rate})
+            logger.info("zero-day holdout=%s run=%s: detection_rate=%.3f", name, label, rate)
     return pd.DataFrame(rows)
 
 
