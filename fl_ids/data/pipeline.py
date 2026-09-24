@@ -8,7 +8,8 @@ samples across simulated clients non-IID via a Dirichlet(alpha) label-skew
 split, and — per client, never globally — carves out a held-out benign
 validation slice (for autoencoder reconstruction-error thresholding) and a
 held-out test slice (for evaluation), then normalizes each client's splits
-using a scaler fit only on that client's own training data.
+using a scaler fit only on that client's own training data, with z-scores
+clipped (`normalize_with_scaler`).
 
 The column drop list and one-hot categorical column list below are taken
 verbatim from the dataset authors' own preprocessing recipe (see
@@ -271,6 +272,39 @@ def _split_client_data(
     return train_idx, val_benign_idx, test_idx
 
 
+def normalize_with_scaler(
+    X_raw: np.ndarray, mean: np.ndarray, scale: np.ndarray, clip: float | None
+) -> np.ndarray:
+    """Standardize rows with a client's scaler parameters, clipping the z-scores.
+
+    The one normalization every stage uses -- client training, evaluation
+    and Phase B live scoring -- so a row is scored the same way wherever it
+    appears.
+
+    **Why clip.** Under heavy Dirichlet skew a client's training rows can
+    barely vary on a feature (counters such as udp.stream or tcp.seq), so
+    its std for that feature is tiny and ordinary rows land 10^3-10^4 std
+    out. One such feature's squared error then swamps the other 90 in the
+    reconstruction error, making it useless for that client (observed: a
+    client whose benign validation loss was ~7,500 while every other
+    client's was < 1). A row `clip` std out is already far past any benign
+    threshold, so clipping keeps it anomalous without letting it dominate.
+
+    Args:
+        X_raw: Raw-scale rows, shape (n_samples, n_features).
+        mean: Per-feature mean (`StandardScaler.mean_`).
+        scale: Per-feature scale (`StandardScaler.scale_`).
+        clip: Clip z-scores to [-clip, clip]; None leaves them unclipped.
+
+    Returns:
+        Normalized rows as float32, same shape as `X_raw`.
+    """
+    X_norm = (X_raw - mean) / scale
+    if clip is not None:
+        X_norm = np.clip(X_norm, -clip, clip)
+    return X_norm.astype(np.float32)
+
+
 def partition_and_normalize_clients(
     X: np.ndarray,
     y: np.ndarray,
@@ -341,9 +375,10 @@ def partition_and_normalize_clients(
 
         if config.normalize_per_client and len(train_idx) > 0:
             scaler = StandardScaler().fit(X_train_raw)
-            X_train_norm = scaler.transform(X_train_raw)
-            X_val_benign_norm = scaler.transform(X_val_benign_raw) if len(val_benign_idx) else X_val_benign_raw
-            X_test_norm = scaler.transform(X_test_raw) if len(test_idx) else X_test_raw
+            clip = config.normalized_clip
+            X_train_norm = normalize_with_scaler(X_train_raw, scaler.mean_, scaler.scale_, clip)
+            X_val_benign_norm = normalize_with_scaler(X_val_benign_raw, scaler.mean_, scaler.scale_, clip)
+            X_test_norm = normalize_with_scaler(X_test_raw, scaler.mean_, scaler.scale_, clip)
         else:
             X_train_norm, X_val_benign_norm, X_test_norm = X_train_raw, X_val_benign_raw, X_test_raw
 

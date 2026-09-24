@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from fl_ids.data.synthetic import make_synthetic_attack_dataset
+from fl_ids.data.pipeline import normalize_with_scaler
 from fl_ids.eval.common import (
     assign_rows_to_clients,
     build_evaluation_setup_from_arrays,
@@ -74,7 +75,9 @@ def test_rows_from_outside_the_federation_use_their_assigned_clients_scaler(setu
     assert len(set(client_ids)) > 1
     for cid in set(client_ids):
         rows = client_ids == cid
-        np.testing.assert_allclose(X_norm[rows], setup.client_scalers[cid].transform(X_raw[rows]), rtol=1e-5)
+        scaler = setup.client_scalers[cid]
+        expected = normalize_with_scaler(X_raw[rows], scaler.mean_, scaler.scale_, setup.normalized_clip)
+        np.testing.assert_allclose(X_norm[rows], expected, rtol=1e-5, atol=1e-6)
 
 
 def test_cascade_rule_accepts_per_row_thresholds(setup_and_config, trained_autoencoder):

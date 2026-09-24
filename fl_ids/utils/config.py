@@ -27,6 +27,9 @@ class DataConfig:
     # {attack_type: re-extracted CSV} for captures whose rows in the dataset
     # are column-shifted (fl_ids.data.repair). Empty loads the CSV as is.
     capture_repairs: dict[str, str] = field(default_factory=dict)
+    # Per-client z-scores are clipped to [-normalized_clip, normalized_clip]
+    # (fl_ids.data.pipeline.normalize_with_scaler). None disables clipping.
+    normalized_clip: float | None = None
 
 
 @dataclass

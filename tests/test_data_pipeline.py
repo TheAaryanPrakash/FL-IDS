@@ -18,6 +18,7 @@ import pandas as pd
 import pytest
 
 from fl_ids.data.pipeline import (
+    normalize_with_scaler,
     canonicalize_placeholders,
     load_and_encode,
     CATEGORICAL_COLUMNS,
@@ -264,6 +265,20 @@ def test_build_federated_dataset_normalization_is_per_client_not_global(syntheti
             f"client {cid} train features should be ~unit-std under per-client "
             "normalization"
         )
+
+
+def test_normalize_with_scaler_clips_rows_far_outside_a_tight_training_spread():
+    # A counter-like feature that barely varied in the client's training rows:
+    # an ordinary value then sits ~10^4 std out and would dominate the MSE.
+    mean, scale = np.array([100.0, 0.0]), np.array([0.01, 1.0])
+    rows = np.array([[200.0, 0.5], [100.02, -3.0]])
+
+    clipped = normalize_with_scaler(rows, mean, scale, clip=10.0)
+    np.testing.assert_allclose(clipped, [[10.0, 0.5], [2.0, -3.0]], rtol=1e-5)
+    assert clipped.dtype == np.float32
+
+    unclipped = normalize_with_scaler(rows, mean, scale, clip=None)
+    np.testing.assert_allclose(unclipped[0, 0], 10_000.0, rtol=1e-5)
 
 
 @pytest.mark.skipif(not REAL_DATASET_PATH.exists(), reason="real dataset not present")

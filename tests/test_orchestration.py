@@ -28,6 +28,9 @@ from fl_ids.orchestration.phase_a import run_phase_a
 from fl_ids.utils.config import load_config
 from tests.test_data_pipeline import _make_synthetic_dataframe
 
+# Small enough that the round-trip test sees it bind.
+NORMALIZED_CLIP = 0.5
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -49,7 +52,7 @@ def small_bundle(tmp_path):
     save_phase_a_artifacts(
         tmp_path / "bundle", boosting, get_weights(torch_model), class_names, 0,
         [f"f{i}" for i in range(6)], [8, 4], 2, config.cascade, scalers, {0: 0.5, 1: float("inf")},
-        extra_manifest={"seed": 0},
+        NORMALIZED_CLIP, extra_manifest={"seed": 0},
     )
     return tmp_path / "bundle", config, X, boosting, torch_model, scalers
 
@@ -65,7 +68,9 @@ def test_bundle_round_trip_reproduces_the_saved_models(small_bundle):
     assert loaded.client_ids == [0, 1]
     assert loaded.client_thresholds == {0: 0.5, 1: float("inf")}
     mean, scale = scalers[1]
-    np.testing.assert_allclose(loaded.normalize(1, X[:5]), (X[:5] - mean) / scale, rtol=1e-5)
+    expected = np.clip((X[:5] - mean) / scale, -NORMALIZED_CLIP, NORMALIZED_CLIP)
+    assert (np.abs((X[:5] - mean) / scale) > NORMALIZED_CLIP).any(), "the clip should bind on some value"
+    np.testing.assert_allclose(loaded.normalize(1, X[:5]), expected, rtol=1e-5)
     assert loaded.cascade_config == config.cascade
 
 

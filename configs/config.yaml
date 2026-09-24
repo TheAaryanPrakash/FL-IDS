@@ -14,6 +14,14 @@ data:
   val_benign_fraction: 0.15
   test_fraction: 0.15
   normalize_per_client: true
+  # Clip per-client z-scores to +/- this. A client whose training rows barely
+  # vary on a feature (udp.stream, tcp.seq and other counters under heavy
+  # Dirichlet skew) gets a tiny std for it, and ordinary rows then land
+  # 10^3-10^4 std out: one feature's squared error swamps the other 90 and
+  # the client's reconstruction error means nothing. A row 10 std out is
+  # already far past any benign threshold, so clipping there keeps it
+  # anomalous. null disables.
+  normalized_clip: 10.0
   # Captures whose rows in the dataset are column-shifted, replaced by rows
   # re-extracted from the authors' own .pcap (fl_ids.data.repair). MITM's
   # CSV has e.g. udp.time_delta under tcp.seq. Generate with:

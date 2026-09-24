@@ -6,7 +6,7 @@ A bundle is a directory:
   (`BoostingClassifier.to_bytes`).
 - `autoencoder_weights.npz` — the final global autoencoder weights.
 - `client_normalization.npz` — each client's scaler (`mean_<cid>`,
-  `scale_<cid>`).
+  `scale_<cid>`); the z-score clip is in the manifest.
 - `manifest.json` — everything needed to use the above without the
   training-time config: class/feature names, autoencoder architecture,
   cascade decision-rule settings, each client's anomaly threshold, the
@@ -36,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 
+from fl_ids.data.pipeline import normalize_with_scaler
 from fl_ids.models.autoencoder import Autoencoder, set_weights
 from fl_ids.models.boosting import BoostingClassifier
 from fl_ids.utils.config import BoostingConfig, CascadeConfig
@@ -63,6 +64,8 @@ class PhaseAArtifacts:
     client_scalers: dict[int, tuple[np.ndarray, np.ndarray]]
     client_thresholds: dict[int, float]
     manifest: dict = field(default_factory=dict)
+    # z-score clip the clients trained with (data.normalized_clip).
+    normalized_clip: float | None = None
 
     @property
     def client_ids(self) -> list[int]:
@@ -76,7 +79,7 @@ class PhaseAArtifacts:
             KeyError: If the bundle has no scaler for `client_id`.
         """
         mean, scale = self.client_scalers[client_id]
-        return ((X_raw - mean) / scale).astype(np.float32)
+        return normalize_with_scaler(X_raw, mean, scale, self.normalized_clip)
 
 
 def save_phase_a_artifacts(
@@ -91,6 +94,7 @@ def save_phase_a_artifacts(
     cascade_config: CascadeConfig,
     client_scalers: dict[int, tuple[np.ndarray, np.ndarray]],
     client_thresholds: dict[int, float],
+    normalized_clip: float | None,
     extra_manifest: dict | None = None,
 ) -> Path:
     """Write a Phase A model bundle.
@@ -108,6 +112,7 @@ def save_phase_a_artifacts(
         cascade_config: The cascade decision rule the models were evaluated with.
         client_scalers: `{client_id: (mean, scale)}`.
         client_thresholds: `{client_id: anomaly threshold}`.
+        normalized_clip: The z-score clip clients normalized with (None: unclipped).
         extra_manifest: Merged into `manifest.json` (metrics, provenance).
 
     Returns:
@@ -134,6 +139,7 @@ def save_phase_a_artifacts(
             "confidence_threshold": cascade_config.confidence_threshold,
             "anomaly_confidence_clip": list(cascade_config.anomaly_confidence_clip),
         },
+        "normalized_clip": normalized_clip,
         # JSON keys are strings; load_phase_a_artifacts converts back.
         "client_thresholds": {str(cid): float(t) for cid, t in client_thresholds.items()},
         **(extra_manifest or {}),
@@ -217,4 +223,5 @@ def load_phase_a_artifacts(artifact_dir: str | Path, boosting_config: BoostingCo
         client_scalers=scalers,
         client_thresholds=thresholds,
         manifest=manifest,
+        normalized_clip=manifest["normalized_clip"],
     )

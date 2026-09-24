@@ -34,7 +34,7 @@ def bundle_and_data(tmp_path_factory):
     bundle_dir = save_phase_a_artifacts(
         tmp_path_factory.mktemp("bundle"), boosting, get_weights(Autoencoder(6, [8, 4], 2)), class_names, 0,
         [f"f{i}" for i in range(6)], [8, 4], 2, config.cascade, {0: identity, 1: identity},
-        {0: 0.0, 1: float("inf")},
+        {0: 0.0, 1: float("inf")}, None,
     )
     return load_phase_a_artifacts(bundle_dir, config.boosting), X, y, boosting
 

@@ -397,6 +397,7 @@ def run_phase_a(
         config.cascade,
         scalers,
         thresholds,
+        config.data.normalized_clip,
         extra_manifest={
             "test_metrics": test_metrics,
             "bootstrap_boosting_metrics": prepared.boosting_metrics,

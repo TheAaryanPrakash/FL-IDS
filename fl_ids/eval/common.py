@@ -26,7 +26,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-from fl_ids.data.pipeline import load_and_encode, partition_and_normalize_clients
+from fl_ids.data.pipeline import load_and_encode, normalize_with_scaler, partition_and_normalize_clients
 from fl_ids.models.autoencoder import Autoencoder, compute_anomaly_threshold, reconstruction_error, set_weights
 from fl_ids.models.boosting import BoostingClassifier
 from fl_ids.utils.config import Config
@@ -56,6 +56,8 @@ class EvaluationSetup:
     # experiment's held-out attack rows) are normalized the way that
     # client would normalize them.
     client_scalers: dict[int, StandardScaler] = field(default_factory=dict)
+    # The z-score clip the clients normalized with (data.normalized_clip).
+    normalized_clip: float | None = None
     # Classes removed from the calibration set and the federated pool
     # before training (the zero-day experiment's "never seen" attack types).
     excluded_classes: frozenset[int] = frozenset()
@@ -217,6 +219,7 @@ def build_evaluation_setup_from_arrays(
         y_test=y_test,
         test_client_ids=test_client_ids,
         client_scalers=client_scalers,
+        normalized_clip=config.data.normalized_clip,
         excluded_classes=frozenset(excluded_classes),
         X_calib=X_calib,
         y_calib=y_calib,
@@ -305,7 +308,7 @@ def assign_rows_to_clients(
     for cid, scaler in setup.client_scalers.items():
         rows = client_ids == cid
         if rows.any():
-            X_norm[rows] = scaler.transform(X_raw[rows])
+            X_norm[rows] = normalize_with_scaler(X_raw[rows], scaler.mean_, scaler.scale_, setup.normalized_clip)
     return X_norm, client_ids
 
 
