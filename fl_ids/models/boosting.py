@@ -148,6 +148,17 @@ class BoostingClassifier:
             "num_class": self.num_classes,
             "learning_rate": self.config.learning_rate,
             "num_leaves": self.config.num_leaves,
+            # Without these, training diverges on real data: a few rare-class
+            # leaves with near-zero hessian get enormous outputs, held-out
+            # multi_logloss hits its minimum (~0.18) around iteration 16 and
+            # then climbs to 7-14 by iteration 300. Where the model ends up
+            # depends on exactly which rows it trained on -- removing a random
+            # 1% of the calibration set swung benign false-positive rate
+            # between 0.1% and 16% and accuracy between 0.58 and 0.98.
+            # Regularized, the same experiment gives 0.983 accuracy and 0 benign
+            # FPR at every row subset, with no divergence.
+            "min_sum_hessian_in_leaf": self.config.min_sum_hessian_in_leaf,
+            "lambda_l2": self.config.lambda_l2,
             "seed": self.seed,
             "verbosity": -1,
             # LightGBM's default multi-threaded histogram building is NOT

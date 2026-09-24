@@ -21,17 +21,18 @@ boosting:
   # below -- not duplicated here (see fl_ids.models.boosting's module docstring).
   label_source: "server_held_calibration_set"  # or "client_local_labels"
   calibration_fraction: 0.05  # fraction of data held server-side for cold-start bootstrap
-  # num_boost_round/learning_rate/num_leaves re-tuned in Phase 5 against
-  # real Edge-IIoTset data (original synthetic-tuned defaults were
-  # 200/0.05/31). With 95 real features of very uneven importance (e.g.
-  # tcp.checksum's gain dwarfs icmp.checksum's), num_leaves=31 didn't give
-  # LightGBM enough per-round tree capacity to reliably carve out a split
-  # for every class once deterministic training was fixed (see
-  # fl_ids.models.boosting's train() comment) -- num_leaves=127 recovered
-  # real signal for every class down to a few hundred real-world examples.
+  # Phase 5 raised these to 127 leaves / lr 0.1 believing 31 leaves lacked
+  # capacity for rare classes. The real problem was that training diverged
+  # (held-out logloss minimum ~0.18 at iteration ~16, then 7-14 by the end),
+  # so results depended on which rows landed in training, whatever the
+  # capacity. With leaf regularization (min_sum_hessian_in_leaf, lambda_l2) training
+  # is stable, and 31 leaves / lr 0.05 gave the best held-out logloss
+  # (0.041 vs 0.056 for 127 / 0.1) and a smaller model to broadcast.
   num_boost_round: 300
-  learning_rate: 0.1
-  num_leaves: 127
+  learning_rate: 0.05
+  num_leaves: 31
+  min_sum_hessian_in_leaf: 1.0
+  lambda_l2: 1.0
   broadcast_every_n_rounds: 1
   update_every_n_rounds: 3  # incremental update cadence using aggregated histograms
 

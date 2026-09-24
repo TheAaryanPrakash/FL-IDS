@@ -39,6 +39,13 @@ class BoostingConfig:
     num_leaves: int
     broadcast_every_n_rounds: int
     update_every_n_rounds: int
+    # Leaf regularization. Without it, multiclass training diverges on real
+    # Edge-IIoTset data: near-pure leaves on tiny classes get huge outputs,
+    # held-out logloss bottoms out around iteration 16 and then climbs to
+    # 7-14, and results swing wildly with which rows are in the training set
+    # (see fl_ids.models.boosting's train()). Defaults are the validated values.
+    min_sum_hessian_in_leaf: float = 1.0
+    lambda_l2: float = 1.0
 
 
 @dataclass

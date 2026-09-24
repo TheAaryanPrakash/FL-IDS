@@ -26,10 +26,10 @@ from fl_ids.utils.config import load_config
 
 PRODUCTION_CONFIG = load_config()
 
-# Bounds on the bootstrap filter, measured on these tests' real-data
-# pools (seeds 555 and 777): the production config passes 1-18% of
-# attack rows and >=99% of benign rows through to the autoencoder; the
-# old hard-coded config violated one bound or the other at each seed.
+# Bounds on the bootstrap filter, set on these tests' real-data pools
+# (seeds 555 and 777). The pass-through rates originally measured here
+# (1-18% of attack rows, >=99% of benign) predate the leaf-regularization
+# fix to boosting's training divergence; the bounds still hold after it.
 MAX_ATTACK_PASS_THROUGH = 0.3
 MIN_BENIGN_PASS_THROUGH = 0.9
 
