@@ -86,6 +86,17 @@ evaluation:
   convergence_tolerance: 0.1
   output_dir: "results"
 
+orchestration:
+  # Phase A (python -m fl_ids.orchestration.phase_a) writes its model
+  # bundle here; Phase B (python -m fl_ids.orchestration.phase_b) loads it.
+  artifact_dir: "saved_models/phase_a"
+  run_dir: "runs/phase_a"
+  server_address: "127.0.0.1:9091"  # not 8080: that's the SDN bridge
+  live_state_path: "/tmp/fl_ids_training_state.json"  # the dashboard's default
+  pool_subsample_size: 60000
+  malicious_fraction: 0.0
+  fl_timeout_seconds: 3600
+
 logging:
   level: "INFO"
   log_dir: "logs"

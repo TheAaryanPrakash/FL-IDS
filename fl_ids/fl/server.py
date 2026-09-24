@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 
 import torch
-from flwr.common import NDArrays, Parameters, Scalar, ndarrays_to_parameters
+from flwr.common import NDArrays, Parameters, Scalar, ndarrays_to_parameters, parameters_to_ndarrays
 from flwr.server import ServerConfig, start_server
 from flwr.server.history import History
 from flwr.server.strategy import FedAvg, Strategy
@@ -58,6 +58,25 @@ def make_fit_config_fn(boosting_model_bytes: bytes, num_classes: int, benign_cla
     return fit_config
 
 
+class RecordingFedAvg(FedAvg):
+    """Plain FedAvg that keeps the latest aggregated weights, like `TrustFilteredStrategy.latest_weights`.
+
+    Flower's `start_server` returns only the run's history, so without this
+    a FedAvg run's trained model would be unrecoverable once the server exits.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.latest_weights: list | None = None
+
+    def aggregate_fit(self, server_round, results, failures):
+        """FedAvg aggregation, recording the resulting weights."""
+        parameters, metrics = super().aggregate_fit(server_round, results, failures)
+        if parameters is not None:
+            self.latest_weights = parameters_to_ndarrays(parameters)
+        return parameters, metrics
+
+
 def build_initial_parameters(config: Config, input_dim: int) -> Parameters:
     """Build initial global autoencoder weights, so every client starts identically.
 
@@ -79,7 +98,7 @@ def build_strategy(
     benign_class: int,
     input_dim: int,
     min_clients: int,
-) -> FedAvg:
+) -> RecordingFedAvg:
     """Build the Phase 3 vanilla FedAvg strategy.
 
     Args:
@@ -93,9 +112,9 @@ def build_strategy(
             denominator via min_available_clients).
 
     Returns:
-        A configured `FedAvg` strategy.
+        A configured `RecordingFedAvg` (plain FedAvg that keeps its final weights).
     """
-    return FedAvg(
+    return RecordingFedAvg(
         fraction_fit=1.0,
         fraction_evaluate=1.0,
         min_fit_clients=min_clients,
@@ -205,6 +224,10 @@ if __name__ == "__main__":
         help="JSON file of the boosting model's held-out metrics (fl_ids.eval.metrics.stage_report_summary), "
         "recorded in the live state for the dashboard",
     )
+    parser.add_argument(
+        "--final-weights-output", default=None,
+        help="Save the final global autoencoder weights to this .npz (Phase A's trained model)",
+    )
     args = parser.parse_args()
 
     setup_logging()
@@ -237,3 +260,11 @@ if __name__ == "__main__":
         output["round_history"] = strategy.round_history
 
     Path(args.history_output).write_text(json.dumps(output))
+
+    if args.final_weights_output:
+        import numpy as np
+
+        if strategy.latest_weights is None:
+            raise RuntimeError("No aggregation happened, so there are no final weights to save")
+        np.savez(args.final_weights_output, *strategy.latest_weights)
+        logger.info("Saved final global weights to %s", args.final_weights_output)

@@ -107,6 +107,32 @@ class EvaluationConfig:
 
 
 @dataclass
+class OrchestrationConfig:
+    """Phase A / Phase B entrypoints (component 11, fl_ids.orchestration).
+
+    Defaults let hand-built Configs (tests) omit this section.
+    """
+
+    # Where Phase A writes the model bundle Phase B loads.
+    artifact_dir: str = "saved_models/phase_a"
+    # Phase A working files: per-client data handed to client processes,
+    # server history, per-process logs.
+    run_dir: str = "runs/phase_a"
+    # The Flower server's address. Not 8080: that's the SDN bridge's port.
+    server_address: str = "127.0.0.1:9091"
+    # The per-round state file the dashboard's training view polls.
+    live_state_path: str = "/tmp/fl_ids_training_state.json"
+    # Caps the federated pool so CPU-only training finishes in minutes
+    # (same cap as the Phase 6 evaluation setup).
+    pool_subsample_size: int = 60_000
+    # Fraction of clients run as sign-flip attackers in Phase A; 0 for a
+    # normal training run, >0 to demo the trust filter live.
+    malicious_fraction: float = 0.0
+    # How long Phase A waits for the whole Flower run before giving up.
+    fl_timeout_seconds: float = 3600.0
+
+
+@dataclass
 class LoggingConfig:
     level: str
     log_dir: str
@@ -125,6 +151,7 @@ class Config:
     sdn: SDNConfig
     evaluation: EvaluationConfig
     logging: LoggingConfig
+    orchestration: OrchestrationConfig = field(default_factory=OrchestrationConfig)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Config":
@@ -162,6 +189,7 @@ class Config:
             sdn=SDNConfig(**raw["sdn"]),
             evaluation=EvaluationConfig(**raw["evaluation"]),
             logging=LoggingConfig(**raw["logging"]),
+            orchestration=OrchestrationConfig(**raw.get("orchestration", {})),
         )
 
 
@@ -178,3 +206,32 @@ def load_config(path: str | Path | None = None) -> Config:
         A populated Config instance.
     """
     return Config.from_yaml(path if path is not None else _DEFAULT_CONFIG_PATH)
+
+
+def write_config_yaml(config: Config, path: str | Path) -> Path:
+    """Write a `Config` back out as YAML that `Config.from_yaml` reads identically.
+
+    Phase A's client and server processes load their config from a file,
+    so the orchestrator writes the exact in-memory config it's running
+    with (including any CLI overrides) instead of pointing them at
+    `configs/config.yaml`, which may differ.
+
+    Args:
+        config: The config to write.
+        path: Output path.
+
+    Returns:
+        `path`.
+    """
+    from dataclasses import asdict
+
+    def _plain(value):
+        if isinstance(value, dict):
+            return {k: _plain(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_plain(v) for v in value]
+        return value
+
+    path = Path(path)
+    path.write_text(yaml.safe_dump(_plain(asdict(config)), sort_keys=False))
+    return path

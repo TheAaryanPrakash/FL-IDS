@@ -52,6 +52,8 @@ from mininet.log import setLogLevel
 from mininet.net import Mininet
 from mininet.node import OVSSwitch, RemoteController
 
+from fl_ids.sdn.demo_io import DEMO_CONFIG_PATH, DEMO_RESULT_PATH
+
 logger = logging.getLogger(__name__)
 
 
@@ -156,71 +158,45 @@ def _switch_packet_count(switch) -> int:
 def run_live_pcap_demo(
     net: Mininet,
     pcap_path: str,
-    real_csv_path: str,
+    artifact_dir: str | Path,
     bridge_url: str,
     replay_host_name: str = "h1",
+    result_path: str | Path = DEMO_RESULT_PATH,
 ) -> dict:
-    """Phase 7/9 milestone flow: replay real traffic, classify it live, mitigate it for real.
+    """Phase B: replay real traffic, classify it with the Phase A models, mitigate it for real.
 
-    Bootstraps a boosting classifier + autoencoder on the real
-    Edge-IIoTset calibration set (self-contained for this demo — Phase 9's
-    full orchestration loads persisted Phase A models instead), replays
-    `pcap_path` through the topology, extracts features from what
-    actually transited the switch, runs the full cascade, and POSTs the
-    result to the running SDN bridge — which installs a real OpenFlow
-    rule, verifiable via `ovs-ofctl dump-flows`.
+    Loads the Phase A bundle (never trains anything here), replays
+    `pcap_path` from `replay_host_name` through the topology, extracts
+    features from the capture, classifies the device the way its FL client
+    would (`fl_ids.sdn.live_inference`), and POSTs the verdict to the
+    running SDN bridge — which installs a real OpenFlow rule, verifiable
+    via `ovs-ofctl dump-flows`.
 
     Args:
         net: The running `Mininet` network.
         pcap_path: Real `.pcap` capture to replay.
-        real_csv_path: Path to `DNN-EdgeIIoT-dataset.csv`, for bootstrapping.
+        artifact_dir: Phase A bundle directory.
         bridge_url: Base URL of the running SDN mitigation bridge (component 9).
-        replay_host_name: Which host replays the traffic / gets registered as the device.
+        replay_host_name: Which host replays the traffic (h<i+1> is FL client i).
+        result_path: Where to write the JSON result for the Phase B orchestrator.
 
     Returns:
-        The bridge's `/mitigate` response payload.
+        The result: the device classification, the bridge's `/mitigate`
+        response, the switch's packet counters around the replay, and the
+        flow table afterwards.
     """
     import requests
-    from sklearn.model_selection import train_test_split
-    from sklearn.preprocessing import StandardScaler
 
-    from fl_ids.data.pipeline import load_and_encode
-    from fl_ids.models.autoencoder import Autoencoder, compute_anomaly_threshold, reconstruction_error, train_autoencoder
-    from fl_ids.models.boosting import BoostingClassifier
-    from fl_ids.models.cascade import cascade_predict
+    from fl_ids.orchestration.artifacts import load_phase_a_artifacts
     from fl_ids.sdn.feature_extraction import extract_features_for_inference
-    from fl_ids.utils.config import AutoencoderConfig, BoostingConfig, CascadeConfig
+    from fl_ids.sdn.live_inference import classify_device_traffic
+    from fl_ids.utils.config import load_config
 
-    logger.info("Bootstrapping cascade models from %s", real_csv_path)
-    X, y, label_encoder, feature_names, benign_class = load_and_encode(real_csv_path)
-    X_calib, _, y_calib, _ = train_test_split(X, y, train_size=0.05, random_state=42, stratify=y)
-
-    boosting_config = BoostingConfig(
-        label_source="server_held_calibration_set", calibration_fraction=0.05,
-        num_boost_round=300, learning_rate=0.1, num_leaves=127,
-        broadcast_every_n_rounds=1, update_every_n_rounds=3,
+    artifacts = load_phase_a_artifacts(artifact_dir, load_config().boosting)
+    logger.info(
+        "Loaded Phase A bundle from %s (%d clients, trained %s)",
+        artifact_dir, len(artifacts.client_ids), artifacts.manifest.get("provenance", {}).get("created_at", "?"),
     )
-    cascade_config = CascadeConfig(confidence_threshold=0.7, anomaly_confidence_clip=(0.0, 1.0))
-    boosting_model = BoostingClassifier(
-        boosting_config, len(label_encoder.classes_), benign_class, seed=42,
-        confidence_threshold=cascade_config.confidence_threshold,
-    )
-    boosting_model.train(X_calib, y_calib)
-
-    mask = boosting_model.passes_to_autoencoder(X_calib)
-    scaler = StandardScaler().fit(X_calib)
-    X_calib_norm = scaler.transform(X_calib).astype("float32")
-    ae_config = AutoencoderConfig(
-        bottleneck_dim=8, hidden_dims=[32, 16], learning_rate=0.01, local_epochs=5, batch_size=64,
-        anomaly_percentile=97, reconstruction_error_bins=20, reconstruction_error_range=(0.0, 5.0),
-    )
-    autoencoder = Autoencoder(X.shape[1], ae_config.hidden_dims, ae_config.bottleneck_dim)
-    train_autoencoder(autoencoder, X_calib_norm[mask], ae_config, seed=42)
-    benign_mask = mask & (y_calib == benign_class)
-    threshold = compute_anomaly_threshold(
-        reconstruction_error(autoencoder, X_calib_norm[benign_mask]), ae_config.anomaly_percentile
-    )
-    logger.info("Cascade models ready (anomaly threshold=%.4f)", threshold)
 
     # Register every host with the bridge up front (not just the replaying
     # one, and before any traffic flows), so the dashboard's device and
@@ -250,61 +226,49 @@ def run_live_pcap_demo(
             "traffic may not have actually transited the switch",
             packets_before, packets_after,
         )
-    live_X_raw = extract_features_for_inference(pcap_path, feature_names)
-    live_X_norm = scaler.transform(live_X_raw).astype("float32")
-
-    output = cascade_predict(
-        boosting_model, autoencoder, threshold, live_X_raw, live_X_norm,
-        list(label_encoder.classes_), cascade_config,
-    )
-
-    # Aggregate per-packet cascade output to one device-level classification:
-    # the most frequent non-benign label, if any packet triggered one,
-    # else "benign". Confidence is that label's mean confidence, and the
-    # reported cascade stage is whichever stage made that label's calls.
-    non_benign_mask = output.predicted_label != "benign"
-    if non_benign_mask.any():
-        labels, counts = np.unique(output.predicted_label[non_benign_mask], return_counts=True)
-        device_classification = labels[np.argmax(counts)]
-        label_mask = non_benign_mask & (output.predicted_label == device_classification)
-        device_confidence = float(output.confidence[label_mask].mean())
-    else:
-        device_classification = "benign"
-        label_mask = np.ones(len(output.predicted_label), dtype=bool)
-        device_confidence = float(output.confidence.mean())
-    stages, stage_counts = np.unique(output.stage[label_mask], return_counts=True)
-    device_stage = str(stages[np.argmax(stage_counts)])
-
+    live_X_raw = extract_features_for_inference(pcap_path, artifacts.feature_names)
+    verdict = classify_device_traffic(artifacts, replay_host_name, live_X_raw)
     logger.info(
-        "Device-level classification for %s: %s (confidence=%.3f, stage=%s, %d/%d packets non-benign)",
-        replay_host_name, device_classification, device_confidence, device_stage,
-        non_benign_mask.sum(), len(output.predicted_label),
+        "Device-level classification for %s (client %d): %s (confidence=%.3f, stage=%s, %d/%d packets non-benign)",
+        verdict.device_id, verdict.client_id, verdict.classification, verdict.confidence, verdict.stage,
+        verdict.num_non_benign, verdict.num_packets,
     )
 
     response = requests.post(
         f"{bridge_url}/mitigate",
         json={
-            "device_id": replay_host_name,
-            "classification": device_classification,
-            "confidence": device_confidence,
-            "stage": device_stage,
+            "device_id": verdict.device_id,
+            "classification": verdict.classification,
+            "confidence": verdict.confidence,
+            "stage": verdict.stage,
         },
         timeout=5,
     )
-    result = response.json()
-    logger.info("Mitigation result: %s", result)
+    mitigation = response.json()
+    logger.info("Mitigation result: %s", mitigation)
 
     # Capture the real flow-table proof *now*, from inside this process --
-    # the topology (and with it, the switch) gets torn down immediately
-    # after this function returns, so an external `ovs-ofctl` check
-    # racing that teardown isn't reliable.
+    # the topology (and with it, the switch) gets torn down right after
+    # this returns, so an external `ovs-ofctl` check racing that teardown
+    # isn't reliable.
     switch = net.get("s1")
     flow_dump = switch.cmd("ovs-ofctl -O OpenFlow13 dump-flows s1")
     logger.info("Flow table after mitigation (ovs-ofctl dump-flows s1):\n%s", flow_dump)
-    summary = f"=== LIVE DEMO RESULT ===\n{result}\n\n=== FLOW TABLE (ovs-ofctl dump-flows s1) ===\n{flow_dump}"
-    print(summary, flush=True)
-    Path("/tmp/fl_ids_live_demo_result.txt").write_text(summary)
 
+    result = {
+        "pcap": str(pcap_path),
+        "artifact_dir": str(artifact_dir),
+        "device_ip": host_ip_map(net, len(net.hosts))[replay_host_name],
+        "classification": verdict.to_dict(),
+        "mitigation": mitigation,
+        "switch_packets_before": packets_before,
+        "switch_packets_after": packets_after,
+        "flow_table": flow_dump,
+    }
+    import json
+
+    Path(result_path).write_text(json.dumps(result, indent=2))
+    print(f"=== LIVE DEMO RESULT ===\n{json.dumps(result, indent=2)}", flush=True)
     return result
 
 
@@ -315,7 +279,7 @@ def run_live_pcap_demo(
 # demo parameters are read from this fixed path instead when present;
 # CLI flags still work fine for direct (non-sudo-constrained) use and
 # override the file's values.
-DEFAULT_DEMO_CONFIG_PATH = Path("/tmp/fl_ids_topology_demo_config.json")
+DEFAULT_DEMO_CONFIG_PATH = DEMO_CONFIG_PATH
 
 
 def _load_demo_config_defaults(path: Path) -> dict:
@@ -331,8 +295,6 @@ def _load_demo_config_defaults(path: Path) -> dict:
 if __name__ == "__main__":
     import argparse
 
-    import numpy as np
-
     from fl_ids.utils.logging_setup import setup_logging
 
     setup_logging(level="INFO")
@@ -347,7 +309,12 @@ if __name__ == "__main__":
     parser.add_argument("--bridge-iface", default=None)
     parser.add_argument("--cli", action="store_true", help="Drop into the Mininet CLI after startup")
     parser.add_argument("--replay-pcap", default=None, help="Run the live classification+mitigation demo with this .pcap")
-    parser.add_argument("--real-csv-path", default="data/raw/DNN-EdgeIIoT-dataset.csv")
+    parser.add_argument(
+        "--artifact-dir", default=str(_PROJECT_ROOT / "saved_models" / "phase_a"),
+        help="Phase A model bundle to classify with (see fl_ids.orchestration.phase_a)",
+    )
+    parser.add_argument("--replay-host", default="h1", help="Host that replays the capture (h<i+1> is FL client i)")
+    parser.add_argument("--result-path", default=str(DEMO_RESULT_PATH))
     parser.add_argument("--bridge-url", default="http://127.0.0.1:8080")
     parser.add_argument(
         "--hold-seconds", type=float, default=0.0,
@@ -359,7 +326,10 @@ if __name__ == "__main__":
     mininet_net = build_topology(args.num_hosts, args.controller_ip, args.controller_port, args.bridge_iface)
     try:
         if args.replay_pcap:
-            run_live_pcap_demo(mininet_net, args.replay_pcap, args.real_csv_path, args.bridge_url)
+            run_live_pcap_demo(
+                mininet_net, args.replay_pcap, args.artifact_dir, args.bridge_url,
+                replay_host_name=args.replay_host, result_path=args.result_path,
+            )
         if args.hold_seconds > 0:
             import time
 

@@ -87,6 +87,10 @@ class TrustFilteredStrategy(FedAvg):
         self.trust_tracker = TrustTracker(config.robustness.trust_ema_alpha)
         self._round_start_weights: list = []
         self.round_history: list[dict] = []
+        # The global weights after the most recent aggregation -- what Phase A
+        # saves as the trained model once the run ends (Flower's start_server
+        # returns only history, not the final parameters).
+        self.latest_weights: list | None = None
 
     def _write_live_state(self) -> None:
         if self.live_state_path is None:
@@ -166,11 +170,13 @@ class TrustFilteredStrategy(FedAvg):
 
         if not filter_result.survivors:
             logger.warning("Round %d: every client excluded by the trust filter; skipping aggregation", server_round)
+            self.latest_weights = self._round_start_weights
             return ndarrays_to_parameters(self._round_start_weights), {"num_survivors": 0}
 
         surviving_deltas = [filter_result.clipped_deltas[cid] for cid in filter_result.survivors]
         aggregated_delta = trimmed_mean_delta(surviving_deltas, self.config.robustness.trim_fraction)
         new_global_weights = apply_delta(self._round_start_weights, aggregated_delta)
+        self.latest_weights = new_global_weights
 
         return ndarrays_to_parameters(new_global_weights), {"num_survivors": len(filter_result.survivors)}
 
