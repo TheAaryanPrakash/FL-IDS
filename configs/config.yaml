@@ -113,8 +113,9 @@ evaluation:
   # scored as unseen traffic. Empty list = run every attack class.
   zero_day_holdout_classes: []
   zero_day_max_holdout_rows: 5000
-  # A run has converged once validation loss stays within this relative band
-  # of its best and ends there; runs that don't (diverged) report NaN.
+  # A run has converged once validation loss stays within this fraction of
+  # its total improvement (first round -> best) above its best, and ends
+  # there; runs that don't (diverged) report NaN.
   convergence_tolerance: 0.1
   output_dir: "results"
 

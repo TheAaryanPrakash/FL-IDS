@@ -64,16 +64,24 @@ class SimulationResult:
         return sum(r.communication_bytes for r in self.rounds)
 
     def rounds_to_convergence(self, tolerance: float) -> float:
-        """First round after which validation loss stays within `tolerance` of its best; NaN if it never settles.
+        """First round after which validation loss stays near its best; NaN if it never settles.
 
-        A run counts as converged only if it *ends* within the band
-        (loss <= best * (1 + tolerance)). A run that diverges — e.g. plain
-        FedAvg under poisoning, whose loss is lowest in round 1 and then
-        explodes — reports NaN rather than "converged in round 1".
+        "Near" is `tolerance` of the run's total improvement:
+        loss <= best + tolerance * (first - best). A band relative to the
+        best loss alone breaks for runs that converge to a small loss: at
+        best 0.015 a 10% band is +/-0.0015, below the round-to-round noise
+        of a healthy run, which then reported NaN. Scaling the band by the
+        improvement makes it independent of the loss's magnitude.
+
+        A run counts as converged only if it *ends* within the band. A run
+        that diverges — e.g. plain FedAvg under poisoning, whose loss is
+        lowest in round 1 and then explodes — has zero improvement, so its
+        band is its round-1 loss and it reports NaN rather than "converged
+        in round 1".
 
         Args:
-            tolerance: Relative band around the best loss
-                (`evaluation.convergence_tolerance`).
+            tolerance: Fraction of the total improvement allowed above the
+                best loss (`evaluation.convergence_tolerance`).
 
         Returns:
             A 1-based round number, or NaN.
@@ -81,7 +89,8 @@ class SimulationResult:
         losses = np.array([r.mean_val_loss for r in self.rounds], dtype=np.float64)
         if len(losses) == 0 or not np.isfinite(losses[-1]):
             return float("nan")
-        band = np.nanmin(losses) * (1 + tolerance)
+        best = np.nanmin(losses)
+        band = best + tolerance * (losses[0] - best)
         within = np.isfinite(losses) & (losses <= band)
         if not within[-1]:
             return float("nan")

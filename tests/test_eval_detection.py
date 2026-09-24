@@ -146,6 +146,9 @@ def _result(losses: list[float]) -> SimulationResult:
         ([1.0, 0.5, 0.3, 0.29, 0.3], 3.0),  # settles in round 3 and stays
         ([0.5, 0.3, 0.6, 0.3, 0.31], 4.0),  # leaves the band once, so it counts from after that
         ([0.5], 1.0),
+        # Converged to a small loss with noise far above 10% of the best
+        # (a real full-pipeline run); a best-relative band called this NaN.
+        ([0.2448, 0.0614, 0.0206, 0.0154, 0.0208, 0.0180, 0.0216, 0.0352, 0.0302, 0.0261], 3.0),
     ],
 )
 def test_rounds_to_convergence(losses, expected):

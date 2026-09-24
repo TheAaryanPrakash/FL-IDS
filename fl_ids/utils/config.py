@@ -123,7 +123,8 @@ class EvaluationConfig:
     # Cap on held-out-class rows scored per run (runtime bound only).
     zero_day_max_holdout_rows: int = 5000
     # rounds_to_convergence: a run has converged once its validation loss
-    # stays within this relative band of its best (and ends there).
+    # stays within this fraction of its total improvement above its best
+    # (and ends there).
     convergence_tolerance: float = 0.1
 
 
