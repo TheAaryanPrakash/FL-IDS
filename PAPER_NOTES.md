@@ -13,8 +13,9 @@
 >
 > This is notes, not prose. The paper gets written from this.
 
-Last updated: 2026-09-24, at commit `f48f5fe` + this file. Phase 6
-regeneration in progress (started 20:11 at commit `7d127a0`).
+Last updated: 2026-09-25. Phase 6 regeneration at commit `7d127a0`: ablation
+complete; poisoning sweep and standalone zero-day killed for low memory
+(§8.3), to be rerun sequentially.
 
 ---
 
@@ -28,7 +29,7 @@ regeneration in progress (started 20:11 at commit `7d127a0`).
 | 3 Core FL loop | `af49e8f` | done |
 | 4 Robustness layer | `a47d93f` | done; exclusion rule changed in `7d127a0` (§4.6) |
 | 5 Real data | `680e1a7` | done; its numbers predate the leak fix (§9) |
-| 6 Evaluation | `854cd3b` harness; `0224a6d`, `2341ed8`, `11103fe` | harness done; **final numbers regenerating** at `7d127a0`, 20 rounds, seed 42 |
+| 6 Evaluation | `854cd3b` harness; `0224a6d`, `2341ed8`, `11103fe` | harness done; at `7d127a0` (20 rounds, seed 42): **ablation complete**; poisoning sweep and standalone zero-day killed for low memory, need a sequential rerun |
 | 7 SDN | `5cbb35c` | milestone demo done pre-leak-fix; **must re-run with the Phase A bundle** |
 | 8 Dashboard | `0fa7c81`; app tests `f48f5fe` | done |
 | 11 Orchestration | `0a0726f` | code done; **real-data Phase A never completed** (last attempt interrupted at round 10/20) |
@@ -537,11 +538,69 @@ That is the traffic the autoencoder backstop exists for.
 Per-class precision and AUROC: pending (the harness's final
 `stage_report` output).
 
-### 8.2 Ablation (30% sign-flip attackers, 20 rounds, seed 42, commit `7d127a0`)
-Source: `results/logs/ablation.log` (harness log lines, 2026-09-24
-20:18–20:48). Final CSV `results/ablation_table.csv` pending. It adds
-detection F1, zero-day macro-recall, final val loss, rounds to
-convergence and communication bytes.
+### 8.2 Ablation (30% sign-flip attackers, 20 rounds, seed 42, commit `7d127a0`) — COMPLETE
+Source: `results/ablation_table.csv`, `results/ablation_zero_day_detail.csv`
+(written 2026-09-25 04:48), `results/ablation_per_class_recall.csv`
+(2026-09-24 20:48). Attackers = clients {0, 6, 9}. Zero-day columns: each
+variant retrained once per held-out attack class (14 × 5 runs), with 30%
+attackers in every run.
+
+Full table (exact CSV values):
+
+| Variant | attack_macro_recall | attack_micro_recall | benign_fpr | detection_f1 | zero_day_macro_recall | autoencoder_alone_attack_macro_recall | final_val_loss | rounds_to_convergence | total_communication_bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| full_pipeline | 0.8868 | 0.8876 | 0.0260 | 0.9093 | 0.7308 | 0.4209 | 0.02121 | 3 | 11,678,400 |
+| plain_fedavg | 0.8791 | 0.8834 | 0.0309 | 0.9014 | 0.5946 | 0.0000 | 9.199e+14 | NaN (diverged) | 11,678,400 |
+| trimmed_mean_only | 0.8785 | 0.8822 | 0.0330 | 0.8982 | 0.5394 | 0.0000 | 4830 | NaN (diverged) | 11,678,400 |
+| autoencoder_only | 0.1912 | 0.1337 | 0.0348 | 0.2191 | 0.3250 | 0.1912 | 0.02948 | 9 | 11,678,400 |
+| boosting_only | 0.8750 | 0.8799 | 0.0000 | 0.9361 | 0.5178 | n/a | n/a | NaN (diverged) | 0 |
+
+Zero-day detection rate by held-out class (cascade detection for
+full_pipeline / plain_fedavg / trimmed_mean_only; AE alone for
+autoencoder_only; cascade rule without backstop for boosting_only). Up to
+5,000 held-out rows each (MITM 406, Fingerprinting 853 after dedup):
+
+| Held-out class | full_pipeline | plain_fedavg | trimmed_mean_only | autoencoder_only | boosting_only |
+|---|---:|---:|---:|---:|---:|
+| Backdoor | 0.8060 | 0.7960 | 0.8038 | 0.0036 | 0.8570 |
+| DDoS_HTTP | 0.3976 | 0.3244 | 0.3278 | 0.0562 | 0.3194 |
+| DDoS_ICMP | 1.0000 | 1.0000 | 1.0000 | 0.8060 | 1.0000 |
+| DDoS_TCP | 0.9750 | 0.9238 | 0.9180 | 0.1652 | 0.9026 |
+| DDoS_UDP | 0.9028 | 0.9998 | 0.0922 | 0.8914 | 0.0922 |
+| Fingerprinting | 0.8429 | 0.8300 | 0.9601 | 0.5064 | 0.8007 |
+| MITM | 0.8867 | 0.0000 | 0.0000 | 0.8744 | 0.0000 |
+| Password | 0.4228 | 0.3710 | 0.3732 | 0.1252 | 0.3420 |
+| Port_Scanning | 0.9814 | 0.9212 | 0.9218 | 0.1310 | 0.9078 |
+| Ransomware | 0.5358 | 0.5334 | 0.5332 | 0.0158 | 0.5298 |
+| SQL_injection | 0.6144 | 0.5698 | 0.5672 | 0.0966 | 0.5256 |
+| Uploading | 0.5128 | 0.4784 | 0.4780 | 0.0954 | 0.4264 |
+| Vulnerability_scanner | 0.8346 | 0.1036 | 0.1004 | 0.6802 | 0.1026 |
+| XSS | 0.5180 | 0.4734 | 0.4756 | 0.1022 | 0.4426 |
+
+Readings:
+- **Zero-day macro-recall: full pipeline 0.7308 vs boosting-only 0.5178**
+  (+0.213), vs plain FedAvg 0.5946 and trimmed-mean-only 0.5394 (the same
+  cascade with a poisoned AE). This is the backstop's contribution on
+  attacks boosting never saw, and what poisoning takes away from it.
+- Largest gains are where boosting has nothing to fall back on: MITM
+  0.8867 (boosting-only 0.0000), Vulnerability_scanner 0.8346 (0.1026),
+  DDoS_UDP 0.9028 (0.0922). Poisoned variants lose them (MITM 0.0000 for
+  plain_fedavg and trimmed_mean_only; Vulnerability_scanner ~0.10).
+- Anomalies to explain, not hide: (a) plain_fedavg gets DDoS_UDP 0.9998
+  > full 0.9028 with a diverged AE (val loss 9.2e14): a blown-up AE still
+  thresholds at the 97th benign percentile, so extreme-valued attacks
+  clear it (this is what its 0.5946 macro-recall above boosting-only
+  reflects). (b) trimmed_mean_only gets Fingerprinting 0.9601 > full
+  0.8429. (c) Backdoor: boosting-only 0.857 > full 0.806. Candidate
+  cause for (c): full_pipeline's boosting model is incrementally updated
+  from alerts during training, boosting_only's is not. Unverified.
+- Convergence: full_pipeline converges by round 3 (final val loss 0.0212).
+  plain_fedavg (9.2e14) and trimmed_mean_only (4,830) diverge (NaN).
+  autoencoder_only converges by round 9 (0.0295).
+- Communication: 11,678,400 bytes over 20 rounds for every FL variant
+  (= 583,920/round). Boosting broadcast excluded (§8.6).
+
+Harness log lines for the main columns (same run, matching the CSV to 3 dp):
 
 | Variant | Attack macro-recall | Benign FPR | AE-alone attack macro-recall |
 |---|---:|---:|---:|
@@ -584,9 +643,13 @@ written 20:48, same run):
 | XSS | 0.7846 | 0.7846 | 0.7846 | 0.2000 | 0.7846 |
 
 ### 8.3 Poisoning-resistance sweep (full pipeline, 20 rounds, seed 42, commit `7d127a0`)
-Source: `results/logs/poisoning_sweep.log`. Final CSV/plot
-(`results/poisoning_resistance_sweep.{csv,png}`) pending, with zero-day
-macro-recall per fraction.
+Source: `results/logs/poisoning_sweep.log`. **The run was killed on
+2026-09-25 04:48** (Claude Code stopped the background job for low
+system memory, when the standalone zero-day experiment started loading
+the dataset alongside it). This happened at 53 of 70 zero-day runs, and
+the sweep writes its CSV/plot only at the end, so they don't exist. The
+per-fraction values below are its harness log lines. Zero-day
+macro-recall per fraction: pending a rerun.
 
 | Malicious fraction | Attack macro-recall | Benign FPR | AE-alone macro-recall | Malicious-client survival |
 |---:|---:|---:|---:|---:|
@@ -623,7 +686,10 @@ AE-alone 0.397 → 0.374 (worse). The trade-off is mixed on one seed;
 report both sides.
 
 ### 8.5 Zero-day (leave-one-class-out)
-Source: log lines so far (commit `7d127a0`, 20 rounds, seed 42):
+Per-variant zero-day at 30% attackers: complete, see §8.2. The standalone
+per-stage experiment (0% attackers, `zero_day_holdout.csv`) was not run
+(regeneration stopped, §8.3). Early log lines (commit `7d127a0`, 20
+rounds, seed 42):
 - Backdoor held out, ablation (30% attackers): full_pipeline cascade
   detection 0.806, plain_fedavg 0.796, trimmed_mean_only 0.804.
 - Backdoor held out, sweep at 0%: 0.855.
@@ -632,9 +698,11 @@ Source: log lines so far (commit `7d127a0`, 20 rounds, seed 42):
 
 ### 8.6 Communication cost and convergence
 - Per round: 583,920 bytes (10 clients × down + up × 7,299 float32
-  parameters). Measured by the harness in a 10-round run at `6bb8317`.
-  The architecture is unchanged since, so it's the same at 20 rounds.
-  Totals and rounds-to-convergence: pending (ablation CSV).
+  parameters). Total over 20 rounds: 11,678,400 bytes per FL variant
+  (ablation CSV, `7d127a0`).
+- Rounds to convergence (ablation CSV): full_pipeline 3; autoencoder_only
+  9; plain_fedavg and trimmed_mean_only diverged (NaN). Sweep values:
+  pending.
 - The boosting broadcast is not included (LightGBM text model; the
   bootstrap `boosting_model.txt` was 11,346,574 bytes on disk, so
   broadcasting it every round dwarfs the AE traffic). **Worth reporting;
