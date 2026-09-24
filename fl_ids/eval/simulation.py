@@ -21,6 +21,7 @@ import logging
 from dataclasses import dataclass, field
 
 import numpy as np
+import torch
 
 from fl_ids.fl.client import AutoencoderClient
 from fl_ids.models.autoencoder import Autoencoder, get_weights, set_weights
@@ -134,6 +135,10 @@ def run_simulated_fl_training(
 
     clients = _make_clients(client_data, config, input_dim, malicious_client_ids, use_boosting_filter, amplification)
 
+    # Explicit seed: torch's default generator differs per process, so an
+    # unseeded init made each run (and each ablation variant) start from
+    # different weights -- breaking "same data, same seed" comparisons.
+    torch.manual_seed(seed)
     torch_seed_model = Autoencoder(input_dim, config.autoencoder.hidden_dims, config.autoencoder.bottleneck_dim)
     global_weights = get_weights(torch_seed_model)
 
