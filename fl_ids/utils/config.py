@@ -96,6 +96,11 @@ class RobustnessConfig:
     norm_clip_multiplier: float
     mad_outlier_threshold: float
     trust_ema_alpha: float
+    # Exclude updates whose cosine similarity to the round's consensus is
+    # below this (0: pointing away from it), and clients whose EMA trust
+    # is below min_trust_score. None disables either check.
+    min_cosine_similarity: float | None = 0.0
+    min_trust_score: float | None = 0.5
     # What sign-flip test attackers report as their example count:
     # "honest" (their true count) or "max_client" (the largest client's
     # count -- inflating their weight under plain FedAvg, as attackers in

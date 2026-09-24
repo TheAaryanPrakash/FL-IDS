@@ -53,15 +53,15 @@ def per_client_reconstruction_error_df(round_history: list[dict]) -> pd.DataFram
 
 
 def survivors_table(round_history: list[dict]) -> pd.DataFrame:
-    """One row per round: which clients survived the trust filter, which were excluded."""
+    """One row per round: which clients survived the trust filter, which were excluded and why."""
     rows = []
     for entry in round_history:
-        is_outlier = entry.get("is_outlier", {})
+        reasons = entry.get("exclusion_reasons", {})
         rows.append(
             {
                 "round": entry["round"],
                 "survivors": ", ".join(str(c) for c in entry.get("survivors", [])),
-                "excluded": ", ".join(cid for cid, flagged in is_outlier.items() if flagged),
+                "excluded": ", ".join(f"{cid} ({'+'.join(why)})" for cid, why in reasons.items()),
             }
         )
     return pd.DataFrame(rows)

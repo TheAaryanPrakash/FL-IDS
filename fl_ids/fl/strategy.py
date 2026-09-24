@@ -164,14 +164,15 @@ class TrustFilteredStrategy(FedAvg):
             if "filtered_fraction" in fit_res.metrics:
                 filtered_fractions[cid] = float(fit_res.metrics["filtered_fraction"])
 
-        filter_result = filter_client_deltas(client_deltas, self.config.robustness)
-        trust_scores = self.trust_tracker.update(filter_result.client_ids, filter_result.similarities)
+        filter_result = filter_client_deltas(client_deltas, self.config.robustness, self.trust_tracker)
+        trust_scores = filter_result.trust_scores
 
         logger.info(
-            "Round %d trust filter: %d/%d clients survived. Trust scores: %s",
+            "Round %d trust filter: %d/%d clients survived, excluded %s. Trust scores: %s",
             server_round,
             len(filter_result.survivors),
             len(filter_result.client_ids),
+            filter_result.exclusion_reasons,
             {cid: round(trust_scores[cid], 3) for cid in filter_result.client_ids},
         )
 
@@ -185,6 +186,8 @@ class TrustFilteredStrategy(FedAvg):
                 "round": server_round,
                 "similarities": {cid: float(sim) for cid, sim in zip(filter_result.client_ids, filter_result.similarities)},
                 "is_outlier": {cid: bool(flag) for cid, flag in zip(filter_result.client_ids, filter_result.is_outlier)},
+                # Excluded for any reason (MAD outlier, opposes consensus, low trust).
+                "exclusion_reasons": {cid: reasons for cid, reasons in filter_result.exclusion_reasons.items()},
                 "trust_scores": dict(trust_scores),
                 "survivors": list(filter_result.survivors),
                 "filtered_fractions": filtered_fractions,

@@ -148,3 +148,66 @@ def test_trust_tracker_honest_stays_high_attacker_decays():
 def test_filter_client_deltas_empty_raises_on_stack():
     with pytest.raises(ValueError):
         filter_client_deltas({}, _robustness_config())
+
+
+def _deltas_with_similarities(targets: dict[int, float], dim: int = 4000, seed: int = 0) -> dict[int, np.ndarray]:
+    """Deltas whose cosine similarity to a shared direction is roughly `targets[cid]`.
+
+    Each delta is cos * r + sin * (independent unit noise). In high
+    dimension the noise terms are nearly orthogonal to each other and
+    their coordinate-wise median is small, so the round's median-delta
+    reference lies close to r.
+    """
+    rng = np.random.default_rng(seed)
+    r = rng.normal(size=dim)
+    r /= np.linalg.norm(r)
+    deltas = {}
+    for cid, cos in targets.items():
+        noise = rng.normal(size=dim)
+        noise -= noise.dot(r) * r
+        noise /= np.linalg.norm(noise)
+        deltas[cid] = cos * r + np.sqrt(1 - cos**2) * noise
+    return deltas
+
+
+# Shape of real-data rounds at 20% sign-flip attackers: honest clients split
+# into heavily-skewed shards (~0.25) and typical ones (~0.75); attackers ~-0.2.
+HETEROGENEOUS_ROUND = {0: 0.2, 1: 0.25, 2: 0.3, 3: 0.25, 4: 0.75, 5: 0.8, 6: 0.8, 7: 0.75, 98: -0.25, 99: -0.2}
+
+
+def test_mad_alone_misses_attackers_hidden_by_honest_heterogeneity():
+    deltas = _deltas_with_similarities(HETEROGENEOUS_ROUND)
+    result = filter_client_deltas(deltas, _robustness_config(min_cosine_similarity=None, min_trust_score=None))
+    assert {98, 99} <= set(result.survivors)
+
+
+def test_updates_opposing_the_consensus_are_excluded_even_when_mad_misses_them():
+    deltas = _deltas_with_similarities(HETEROGENEOUS_ROUND)
+    result = filter_client_deltas(deltas, _robustness_config())
+
+    assert set(result.survivors) == set(range(8))
+    for attacker in (98, 99):
+        assert result.exclusion_reasons[attacker] == ["opposes_consensus"]
+    assert sorted(result.excluded) == [98, 99]
+
+
+def test_low_trust_history_excludes_a_client_whose_update_looks_fine_this_round():
+    tracker = TrustTracker(ema_alpha=0.3)
+    tracker.scores[99] = 0.3  # history of opposing the consensus
+    # Honest spread wide enough that MAD doesn't flag +0.1; weakly aligned this round.
+    targets = {cid: HETEROGENEOUS_ROUND[cid] for cid in range(8)} | {99: 0.1}
+    deltas = _deltas_with_similarities(targets)
+
+    result = filter_client_deltas(deltas, _robustness_config(), tracker)
+
+    assert result.exclusion_reasons == {99: ["low_trust"]}
+    assert result.trust_scores[99] == pytest.approx(tracker.scores[99])
+    assert result.trust_scores[99] < 0.5
+    assert all(result.trust_scores[cid] > 0.5 for cid in range(8))
+
+
+def test_without_a_tracker_trust_is_neither_recorded_nor_checked():
+    targets = {cid: HETEROGENEOUS_ROUND[cid] for cid in range(8)} | {99: 0.1}
+    result = filter_client_deltas(_deltas_with_similarities(targets), _robustness_config())
+    assert result.trust_scores == {}
+    assert 99 in result.survivors

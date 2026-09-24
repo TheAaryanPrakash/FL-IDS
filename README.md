@@ -13,9 +13,11 @@ Five parts, each doing real work:
    with a per-client anomaly threshold (97th percentile of benign
    validation error) recalibrated every round.
 4. **Cosine-similarity trust filter**: the server scores each client's
-   weight *delta*, flags per-round MAD outliers, clips norms above 2x the
-   round median, keeps an EMA trust score per client, and aggregates the
-   survivors with a trimmed mean.
+   weight *delta* against the round's median delta. It excludes per-round
+   MAD outliers, updates pointing away from the consensus (cosine < 0),
+   and clients whose EMA trust has fallen below 0.5. It clips the
+   survivors' norms to 2x the round median and aggregates them with a
+   trimmed mean.
 5. **SDN mitigation** (Mininet + Open vSwitch, OpenFlow 1.3): live
    classifications of replayed `.pcap` captures become real flow rules
    (drop, or an OpenFlow meter for rate limiting).
@@ -156,6 +158,18 @@ and by Phase A itself.
   client. Cosine similarity can't separate the two, and under heavy skew
   the MAD filter sometimes excludes honest small-shard clients for a
   round.
+- **Late-round attackers can look like honest noise.** The filter
+  excludes a client if its similarity is a per-round MAD outlier, if its
+  update points away from the consensus (cosine < 0, the FLTrust
+  precedent), or if its EMA trust falls below 0.5. MAD alone let 20%
+  sign-flip attackers through about 78% of rounds, because honest non-IID
+  spread widened its band past them. With all three checks, attacker
+  exclusion rises to about 62% of attacker-rounds. The misses come once
+  the model has converged: a small-shard attacker's flipped delta is as
+  near-orthogonal as an honest small-shard client's, so it slips through
+  but barely moves the model, and the norm clip plus trimmed mean bound
+  it. The cost is honest near-zero clients excluded in about 9% of
+  client-rounds.
 - **Trimmed mean alone doesn't survive attackers above its trim
   fraction.** With a 15% trim over 10 clients, one update is trimmed from
   each side, so 3 colluding sign-flip attackers get through. The ablation

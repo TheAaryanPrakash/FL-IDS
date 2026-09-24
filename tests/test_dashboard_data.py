@@ -27,7 +27,7 @@ ROUND_HISTORY = [
     {
         "round": 1,
         "trust_scores": {"0": 0.9, "1": 0.85, "99": 0.6},
-        "is_outlier": {"0": False, "1": False, "99": True},
+        "exclusion_reasons": {"99": ["opposes_consensus", "low_trust"]},
         "survivors": [0, 1],
         "mean_filtered_fraction": 0.62,
         "mean_reconstruction_error": 0.5,
@@ -44,7 +44,7 @@ ROUND_HISTORY = [
     {
         "round": 2,
         "trust_scores": {"0": 0.92, "1": 0.88, "99": 0.4},
-        "is_outlier": {"0": False, "1": False, "99": True},
+        "exclusion_reasons": {"99": ["opposes_consensus", "low_trust"]},
         "survivors": [0, 1],
         "mean_filtered_fraction": 0.65,
         "mean_reconstruction_error": 0.35,
@@ -82,7 +82,7 @@ def test_survivors_table_reports_survivors_and_excluded():
     table = survivors_table(ROUND_HISTORY)
     assert len(table) == 2
     assert table.iloc[0]["survivors"] == "0, 1"
-    assert table.iloc[0]["excluded"] == "99"
+    assert table.iloc[0]["excluded"] == "99 (opposes_consensus+low_trust)"
 
 
 def test_devices_table_flattens_registry():

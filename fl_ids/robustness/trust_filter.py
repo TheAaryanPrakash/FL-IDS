@@ -16,6 +16,38 @@ Three requirements carried over from hard lessons in an earlier prototype
    similarity is direction-only and misses scaling attacks (same
    direction, blown-up magnitude).
 
+**Exclusion is three checks, not MAD alone.** A client is excluded if
+any holds (each recorded as a reason in `TrustFilterResult`):
+
+- `mad_outlier`: its similarity is a MAD outlier within this round.
+- `opposes_consensus`: its similarity is below `min_cosine_similarity`
+  (default 0): its update points away from the robust consensus
+  direction. This is the sign boundary, not a tuned cutoff like the 0.5
+  requirement 2 warns about. FLTrust (Cao et al., NDSS 2021) gives such
+  updates zero weight via ReLU(cos) for the same reason.
+- `low_trust`: its EMA trust score (`TrustTracker`) is below
+  `min_trust_score` (default 0.5, i.e. its similarity has averaged below
+  0 over its history), so its history counts, not just this round.
+
+Why MAD alone wasn't enough, measured on real data at 20% sign-flip
+attackers: honest clients' similarities spread from ~0.2 (heavily
+skewed shards) to ~0.8, so the MAD band widened until its cutoff sat at
+-0.6 to -0.8, and attackers at -0.2 to -0.3 passed ~78% of rounds.
+Every attacker round sat below 0 except two near-zero ones (+0.09,
++0.12), which the trust check catches once history accumulates.
+
+What remains, measured with all three checks on (same setup, 12
+rounds): attacker exclusion rose from ~22% to ~62% of attacker-rounds
+(one attacker 10/12, the other 5/12). The misses are late rounds: once
+the model has converged, heavily-skewed honest clients' deltas are
+mostly noise (cosine 0.00-0.07), and an attacker whose true delta is
+also noise sends a sign-flipped noise vector, still near-orthogonal
+(+0.02 to +0.11). No direction test can separate those, and such an
+update barely moves the model; its magnitude is bounded by the norm
+clip and the trimmed mean. The cost: honest near-zero clients are
+excluded in ~9% of client-rounds (was ~2%) when their noise lands just
+below 0.
+
 **Documented limitation (per CLAUDE.md, stated plainly, not hidden):**
 this defense targets malicious *update-sending* behavior (e.g.
 sign-flipping), not malicious local *data*. A client whose local data is
@@ -31,7 +63,7 @@ right test case for what this component can actually defend against.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -71,11 +103,15 @@ class TrustFilterResult:
             reference direction (the coordinate-wise median delta).
         norms: Each client's raw (pre-clip) delta L2 norm.
         is_outlier: True where a client's similarity is a MAD-based
-            statistical outlier this round (excluded from aggregation).
+            statistical outlier this round (one exclusion reason of three).
         clipped_deltas: {client_id: delta}, norm-clipped to
             `norm_clip_multiplier` times the round's median norm — only
-            for surviving (non-outlier) clients.
-        survivors: Client IDs that passed the cosine/MAD filter.
+            for surviving clients.
+        survivors: Client IDs that passed every exclusion check.
+        exclusion_reasons: {client_id: reasons} for excluded clients only
+            (`mad_outlier`, `opposes_consensus`, `low_trust`).
+        trust_scores: {client_id: EMA trust after this round}; empty when
+            no tracker was given.
     """
 
     client_ids: list[int]
@@ -84,12 +120,21 @@ class TrustFilterResult:
     is_outlier: np.ndarray
     clipped_deltas: dict[int, np.ndarray]
     survivors: list[int]
+    exclusion_reasons: dict[int, list[str]] = field(default_factory=dict)
+    trust_scores: dict[int, float] = field(default_factory=dict)
+
+    @property
+    def excluded(self) -> list[int]:
+        """Client IDs excluded from aggregation this round, for any reason."""
+        return list(self.exclusion_reasons)
 
 
 def filter_client_deltas(
-    client_deltas: dict[int, np.ndarray], config: RobustnessConfig
+    client_deltas: dict[int, np.ndarray],
+    config: RobustnessConfig,
+    trust_tracker: TrustTracker | None = None,
 ) -> TrustFilterResult:
-    """Screen client weight deltas for poisoning: cosine/MAD direction check, then norm clip.
+    """Screen client weight deltas for poisoning: direction and trust checks, then norm clip.
 
     The reference direction is the coordinate-wise *median* delta across
     all of this round's clients — robust to a minority of amplified
@@ -101,9 +146,18 @@ def filter_client_deltas(
     similarity is capped at 1.0, so there's no meaningful "too similar to
     the crowd" outlier case — only "direction diverges from the crowd."
 
+    A client is excluded if its similarity is a MAD outlier this round,
+    is below `min_cosine_similarity`, or (with a tracker) its trust score
+    after folding in this round is below `min_trust_score` — see the
+    module docstring for why all three.
+
     Args:
         client_deltas: {client_id: flattened weight delta} for this round.
-        config: `norm_clip_multiplier`, `mad_outlier_threshold`.
+        config: `norm_clip_multiplier`, `mad_outlier_threshold`,
+            `min_cosine_similarity`, `min_trust_score` (None disables
+            either of the last two).
+        trust_tracker: Updated in place with this round's similarities;
+            its scores drive the `low_trust` check. None skips that check.
 
     Returns:
         A `TrustFilterResult` with per-client diagnostics and the set of
@@ -126,13 +180,27 @@ def filter_client_deltas(
         mad = 1e-6
     is_outlier = similarities < (median_sim - config.mad_outlier_threshold * mad)
 
+    trust_scores = trust_tracker.update(client_ids, similarities) if trust_tracker is not None else {}
+
+    exclusion_reasons: dict[int, list[str]] = {}
+    for i, cid in enumerate(client_ids):
+        reasons = []
+        if is_outlier[i]:
+            reasons.append("mad_outlier")
+        if config.min_cosine_similarity is not None and similarities[i] < config.min_cosine_similarity:
+            reasons.append("opposes_consensus")
+        if config.min_trust_score is not None and cid in trust_scores and trust_scores[cid] < config.min_trust_score:
+            reasons.append("low_trust")
+        if reasons:
+            exclusion_reasons[cid] = reasons
+
     median_norm = np.median(norms)
     clip_norm = config.norm_clip_multiplier * median_norm
 
     clipped_deltas: dict[int, np.ndarray] = {}
     survivors: list[int] = []
     for i, cid in enumerate(client_ids):
-        if is_outlier[i]:
+        if cid in exclusion_reasons:
             continue
         delta = deltas[i]
         if clip_norm > 0 and norms[i] > clip_norm:
@@ -140,7 +208,9 @@ def filter_client_deltas(
         clipped_deltas[cid] = delta
         survivors.append(cid)
 
-    return TrustFilterResult(client_ids, similarities, norms, is_outlier, clipped_deltas, survivors)
+    return TrustFilterResult(
+        client_ids, similarities, norms, is_outlier, clipped_deltas, survivors, exclusion_reasons, trust_scores
+    )
 
 
 class TrustTracker:

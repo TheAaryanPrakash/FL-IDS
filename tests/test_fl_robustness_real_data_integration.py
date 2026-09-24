@@ -274,7 +274,7 @@ def test_real_multiprocess_run_on_real_data_separates_honest_and_attacker_trust(
 
     for attacker_id in ATTACKER_CLIENT_IDS:
         attacker_key = str(attacker_id)
-        excluded_rounds = sum(1 for entry in round_history if entry["is_outlier"].get(attacker_key, False))
+        excluded_rounds = sum(1 for entry in round_history if attacker_id not in entry["survivors"])
         print(f"Real-data: attacker {attacker_id} excluded in {excluded_rounds}/{NUM_ROUNDS} rounds")
         assert excluded_rounds >= (NUM_ROUNDS * 0.6), (
             f"Attacker {attacker_id} should be excluded from aggregation in most rounds on real data, "

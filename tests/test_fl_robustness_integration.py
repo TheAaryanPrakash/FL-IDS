@@ -256,7 +256,7 @@ def test_real_multiprocess_run_separates_honest_and_attacker_trust(robustness_ru
     # --- Exclusion check: attacker excluded from aggregation in most rounds ---
     attacker_key = str(ATTACKER_CLIENT_ID)
     excluded_rounds = sum(
-        1 for entry in round_history if entry["is_outlier"].get(attacker_key, False)
+        1 for entry in round_history if ATTACKER_CLIENT_ID not in entry["survivors"]
     )
     print(f"Attacker excluded in {excluded_rounds}/{NUM_ROUNDS} rounds")
     assert excluded_rounds >= (NUM_ROUNDS * 0.6), (

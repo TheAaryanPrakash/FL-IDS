@@ -92,6 +92,14 @@ robustness:
   norm_clip_multiplier: 2.0  # reject/clip updates beyond this multiple of median norm
   mad_outlier_threshold: 3.0  # median absolute deviation multiplier for cosine outlier flag
   trust_ema_alpha: 0.3  # weight on new round's score vs. running trust history
+  # Besides the MAD outlier check, exclude a client whose update points away
+  # from the round's consensus (cosine < min_cosine_similarity) or whose EMA
+  # trust has fallen below min_trust_score (0.5 = similarity averaging below
+  # 0). MAD alone let sign-flip attackers through ~78% of rounds at 20%
+  # poisoning: honest non-IID spread widened its band past them. See
+  # fl_ids.robustness.trust_filter. null disables either check.
+  min_cosine_similarity: 0.0
+  min_trust_score: 0.5
   # Example count the sign-flip test attacker reports: "honest" or
   # "max_client" (claims the largest client's count, inflating its FedAvg
   # weight the way attackers in the literature do; the trust filter and

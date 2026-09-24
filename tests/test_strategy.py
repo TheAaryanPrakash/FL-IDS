@@ -175,7 +175,7 @@ def test_aggregate_fit_records_trust_scores_that_separate_honest_from_attacker_o
     assert attacker_trust < 0.2
     assert min(honest_trust) - attacker_trust > 0.5
 
-    excluded_rounds = sum(1 for entry in strategy.round_history if 99 in entry["is_outlier"] and entry["is_outlier"][99])
+    excluded_rounds = sum(1 for entry in strategy.round_history if 99 not in entry["survivors"])
     assert excluded_rounds >= 5  # attacker excluded in most (>=5/6) rounds
 
 

@@ -210,8 +210,8 @@ def run_simulated_fl_training(
         survivors = None
         if aggregation == "trust_filtered":
             deltas = {cid: compute_delta(w, global_weights) for cid, (w, _n) in fit_results.items()}
-            filter_result = filter_client_deltas(deltas, config.robustness)
-            trust_scores = trust_tracker.update(filter_result.client_ids, filter_result.similarities)
+            filter_result = filter_client_deltas(deltas, config.robustness, trust_tracker)
+            trust_scores = filter_result.trust_scores
             survivors = list(filter_result.survivors)
             if survivors:
                 surviving_deltas = [filter_result.clipped_deltas[cid] for cid in survivors]
