@@ -9,7 +9,7 @@ a `Config` instance instead of hard-coding values.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -89,6 +89,11 @@ class SDNConfig:
 class EvaluationConfig:
     poisoning_fractions: list[float]
     output_dir: str
+    # Zero-day experiment (fl_ids.eval.zero_day): attack classes to hold
+    # out of all training, one run each. Empty = every non-benign class.
+    zero_day_holdout_classes: list[str] = field(default_factory=list)
+    # Cap on held-out-class rows scored per run (runtime bound only).
+    zero_day_max_holdout_rows: int = 5000
 
 
 @dataclass

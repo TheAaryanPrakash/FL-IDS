@@ -75,6 +75,11 @@ sdn:
 
 evaluation:
   poisoning_fractions: [0.0, 0.2, 0.3, 0.4, 0.5]
+  # Zero-day (leave-one-attack-class-out) experiment: each listed class is
+  # withheld from boosting's calibration set AND every client's data, then
+  # scored as unseen traffic. Empty list = run every attack class.
+  zero_day_holdout_classes: []
+  zero_day_max_holdout_rows: 5000
   output_dir: "results"
 
 logging:
