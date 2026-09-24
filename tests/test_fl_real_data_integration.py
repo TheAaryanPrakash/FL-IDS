@@ -26,8 +26,13 @@ from sklearn.model_selection import train_test_split
 
 from fl_ids.data.pipeline import load_and_encode, partition_and_normalize_clients
 from fl_ids.fl.data_io import save_client_data
-from fl_ids.models.boosting import BoostingClassifier
-from fl_ids.utils.config import BoostingConfig, DataConfig
+from fl_ids.utils.config import DataConfig
+from tests.real_data_boosting import (
+    assert_boosting_filter_is_real,
+    boosting_config_section,
+    cascade_config_section,
+    train_bootstrap_boosting,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_DATASET_PATH = Path("data/raw/DNN-EdgeIIoT-dataset.csv")
@@ -56,15 +61,7 @@ def _write_test_config(path: Path, num_clients: int, num_rounds: int, hidden_dim
             "test_fraction": 0.1,
             "normalize_per_client": True,
         },
-        "boosting": {
-            "label_source": "server_held_calibration_set",
-            "calibration_fraction": 0.05,
-            "num_boost_round": 150,
-            "learning_rate": 0.1,
-            "num_leaves": 63,
-            "broadcast_every_n_rounds": 1,
-            "update_every_n_rounds": 3,
-        },
+        "boosting": boosting_config_section(),
         "autoencoder": {
             "bottleneck_dim": 8,
             "hidden_dims": hidden_dims,
@@ -75,7 +72,7 @@ def _write_test_config(path: Path, num_clients: int, num_rounds: int, hidden_dim
             "reconstruction_error_bins": 20,
             "reconstruction_error_range": [0.0, 5.0],
         },
-        "cascade": {"confidence_threshold": 0.6, "anomaly_confidence_clip": [0.0, 1.0]},
+        "cascade": cascade_config_section(),
         "fl": {"num_rounds": num_rounds, "clients_per_round": num_clients, "local_epochs": 3, "strategy": "fedavg"},
         "robustness": {
             "trim_fraction": 0.15,
@@ -112,21 +109,11 @@ def real_fl_run_artifacts(tmp_path_factory):
         )
 
     # Boosting always trains on raw features -- see fl_ids.models.boosting's
-    # module docstring. Real-data-tuned hyperparameters (see configs/config.yaml).
-    boosting_config = BoostingConfig(
-        label_source="server_held_calibration_set",
-        calibration_fraction=0.05,
-        num_boost_round=150,
-        learning_rate=0.1,
-        num_leaves=63,
-        broadcast_every_n_rounds=1,
-        update_every_n_rounds=3,
+    # module docstring. Hyperparameters come from configs/config.yaml (see
+    # tests/real_data_boosting.py for why they must not be hard-coded here).
+    boosting_model = train_bootstrap_boosting(
+        X_calib, y_calib, num_classes=len(label_encoder.classes_), benign_class=benign_class, seed=SEED
     )
-    boosting_model = BoostingClassifier(
-        boosting_config, num_classes=len(label_encoder.classes_), benign_class=benign_class, seed=SEED,
-        confidence_threshold=0.6,
-    )
-    boosting_model.train(X_calib, y_calib)
 
     data_config = DataConfig(
         dnn_csv_path=str(REAL_DATASET_PATH),
@@ -161,7 +148,19 @@ def real_fl_run_artifacts(tmp_path_factory):
         "input_dim": X.shape[1],
         "num_classes": len(label_encoder.classes_),
         "benign_class": benign_class,
+        "boosting_model": boosting_model,
+        "X_pool": X_pool,
+        "y_pool": y_pool,
     }
+
+
+@pytest.mark.skipif(not REAL_DATASET_PATH.exists(), reason="real dataset not present")
+def test_real_data_bootstrap_boosting_filter_actually_filters(real_fl_run_artifacts):
+    """The bootstrap filter clients run must actually filter, or Phase 3's milestone isn't the real pipeline's."""
+    artifacts = real_fl_run_artifacts
+    assert_boosting_filter_is_real(
+        artifacts["boosting_model"], artifacts["X_pool"], artifacts["y_pool"], artifacts["benign_class"]
+    )
 
 
 @pytest.mark.skipif(not REAL_DATASET_PATH.exists(), reason="real dataset not present")

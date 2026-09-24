@@ -7,6 +7,23 @@ pipeline instead of synthetic data. The federated pool is subsampled
 after the calibration split purely to keep runtime bounded — still real
 traffic/features/skew. Skipped (not failed) if the dataset file isn't
 present.
+
+Client count: 8 honest + 2 sign-flip attackers (20% malicious), inside
+CLAUDE.md's 8-10-client range for Phases 2-4. An earlier 4 honest + 1
+attacker version passed only because the bootstrap boosting filter was
+degenerate (see tests/real_data_boosting.py); with a working filter, 5
+clients' worth of non-IID similarity spread was wide enough to hide the
+attacker from the MAD check, and a 15% trim of 5 clients trims nobody.
+
+Attackers hold ordinary Dirichlet shards, drawn in the same partition as
+the honest clients. An earlier version gave each attacker the *entire*
+pool: ~7x more training rows than any honest client, IID where they're
+skewed, normalized over mixed traffic. That made the attackers' true
+(pre-flip) deltas only ~0.2 cosine-aligned with the honest clients', so
+negating them landed at ~0 -- inside honest non-IID spread, where the MAD
+check can't see them. That tested "unusual data", which component 5
+explicitly doesn't claim to catch, rather than the corrupted update it's
+built for.
 """
 
 from __future__ import annotations
@@ -23,14 +40,19 @@ from sklearn.model_selection import train_test_split
 
 from fl_ids.data.pipeline import load_and_encode, partition_and_normalize_clients
 from fl_ids.fl.data_io import save_client_data
-from fl_ids.models.boosting import BoostingClassifier
-from fl_ids.utils.config import BoostingConfig, DataConfig
+from fl_ids.utils.config import DataConfig
+from tests.real_data_boosting import (
+    assert_boosting_filter_is_real,
+    boosting_config_section,
+    cascade_config_section,
+    train_bootstrap_boosting,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REAL_DATASET_PATH = Path("data/raw/DNN-EdgeIIoT-dataset.csv")
 
-NUM_HONEST_CLIENTS = 4
-ATTACKER_CLIENT_ID = 99
+NUM_HONEST_CLIENTS = 8
+ATTACKER_CLIENT_IDS = (98, 99)
 NUM_ROUNDS = 8
 SEED = 777
 POOL_SUBSAMPLE_SIZE = 40_000
@@ -54,15 +76,7 @@ def _write_test_config(path: Path, num_clients: int, num_rounds: int) -> None:
             "test_fraction": 0.1,
             "normalize_per_client": True,
         },
-        "boosting": {
-            "label_source": "server_held_calibration_set",
-            "calibration_fraction": 0.05,
-            "num_boost_round": 150,
-            "learning_rate": 0.1,
-            "num_leaves": 63,
-            "broadcast_every_n_rounds": 1,
-            "update_every_n_rounds": 3,
-        },
+        "boosting": boosting_config_section(),
         "autoencoder": {
             "bottleneck_dim": 8,
             "hidden_dims": [32, 16],
@@ -73,7 +87,7 @@ def _write_test_config(path: Path, num_clients: int, num_rounds: int) -> None:
             "reconstruction_error_bins": 20,
             "reconstruction_error_range": [0.0, 5.0],
         },
-        "cascade": {"confidence_threshold": 0.6, "anomaly_confidence_clip": [0.0, 1.0]},
+        "cascade": cascade_config_section(),
         "fl": {
             "num_rounds": num_rounds,
             "clients_per_round": num_clients,
@@ -112,55 +126,39 @@ def real_robustness_run_artifacts(tmp_path_factory):
             X_pool, y_pool, train_size=POOL_SUBSAMPLE_SIZE, random_state=SEED, stratify=y_pool
         )
 
-    boosting_config = BoostingConfig(
-        label_source="server_held_calibration_set",
-        calibration_fraction=0.05,
-        num_boost_round=150,
-        learning_rate=0.1,
-        num_leaves=63,
-        broadcast_every_n_rounds=1,
-        update_every_n_rounds=3,
+    # Boosting always trains on raw features -- see fl_ids.models.boosting's
+    # module docstring. Hyperparameters come from configs/config.yaml (see
+    # tests/real_data_boosting.py for why they must not be hard-coded here).
+    boosting_model = train_bootstrap_boosting(
+        X_calib, y_calib, num_classes=len(label_encoder.classes_), benign_class=benign_class, seed=SEED
     )
-    boosting_model = BoostingClassifier(
-        boosting_config, num_classes=len(label_encoder.classes_), benign_class=benign_class, seed=SEED,
-        confidence_threshold=0.6,
-    )
-    boosting_model.train(X_calib, y_calib)
 
     data_config = DataConfig(
         dnn_csv_path=str(REAL_DATASET_PATH),
         pcap_dir="unused",
-        num_clients=NUM_HONEST_CLIENTS,
+        num_clients=NUM_HONEST_CLIENTS + len(ATTACKER_CLIENT_IDS),
         dirichlet_alpha=0.3,
         val_benign_fraction=0.2,
         test_fraction=0.1,
         normalize_per_client=True,
     )
-    client_data = partition_and_normalize_clients(X_pool, y_pool, benign_class, config=data_config, seed=SEED)
+    shards = partition_and_normalize_clients(X_pool, y_pool, benign_class, config=data_config, seed=SEED)
 
-    attacker_data_map = partition_and_normalize_clients(
-        X_pool,
-        y_pool,
-        benign_class,
-        config=DataConfig(**{**data_config.__dict__, "num_clients": 1}),
-        seed=SEED + 1,
-    )
-
+    # One Dirichlet partition for everyone; the last shards go to the
+    # attackers, so their data is as ordinary as any honest client's --
+    # the attack is in the update they send, not their data (component 5).
+    client_ids = list(range(NUM_HONEST_CLIENTS)) + list(ATTACKER_CLIENT_IDS)
     data_paths = {}
-    for cid, data in client_data.items():
+    for cid, data in zip(client_ids, shards.values()):
         path = tmp_path / f"client_{cid}.npz"
         save_client_data(path, data)
         data_paths[cid] = path
-
-    attacker_path = tmp_path / f"client_{ATTACKER_CLIENT_ID}.npz"
-    save_client_data(attacker_path, attacker_data_map[0])
-    data_paths[ATTACKER_CLIENT_ID] = attacker_path
 
     boosting_path = tmp_path / "boosting_model.bin"
     boosting_path.write_bytes(boosting_model.to_bytes())
 
     config_path = tmp_path / "config.yaml"
-    _write_test_config(config_path, NUM_HONEST_CLIENTS + 1, NUM_ROUNDS)
+    _write_test_config(config_path, NUM_HONEST_CLIENTS + len(ATTACKER_CLIENT_IDS), NUM_ROUNDS)
 
     history_path = tmp_path / "history.json"
 
@@ -172,7 +170,19 @@ def real_robustness_run_artifacts(tmp_path_factory):
         "input_dim": X.shape[1],
         "num_classes": len(label_encoder.classes_),
         "benign_class": benign_class,
+        "boosting_model": boosting_model,
+        "X_pool": X_pool,
+        "y_pool": y_pool,
     }
+
+
+@pytest.mark.skipif(not REAL_DATASET_PATH.exists(), reason="real dataset not present")
+def test_real_data_bootstrap_boosting_filter_actually_filters(real_robustness_run_artifacts):
+    """The bootstrap filter clients run must actually filter, or Phase 4's milestone isn't the real pipeline's."""
+    artifacts = real_robustness_run_artifacts
+    assert_boosting_filter_is_real(
+        artifacts["boosting_model"], artifacts["X_pool"], artifacts["y_pool"], artifacts["benign_class"]
+    )
 
 
 @pytest.mark.skipif(not REAL_DATASET_PATH.exists(), reason="real dataset not present")
@@ -180,7 +190,7 @@ def test_real_multiprocess_run_on_real_data_separates_honest_and_attacker_trust(
     port = _free_port()
     server_address = f"127.0.0.1:{port}"
     history_path = real_robustness_run_artifacts["history_path"]
-    num_clients = NUM_HONEST_CLIENTS + 1
+    num_clients = NUM_HONEST_CLIENTS + len(ATTACKER_CLIENT_IDS)
 
     server_cmd = [
         sys.executable, "-m", "fl_ids.fl.server",
@@ -202,7 +212,7 @@ def test_real_multiprocess_run_on_real_data_separates_honest_and_attacker_trust(
     client_procs = []
     try:
         for cid, data_path in real_robustness_run_artifacts["data_paths"].items():
-            client_type = "sign_flip" if cid == ATTACKER_CLIENT_ID else "honest"
+            client_type = "sign_flip" if cid in ATTACKER_CLIENT_IDS else "honest"
             client_cmd = [
                 sys.executable, "-m", "fl_ids.fl.client",
                 "--client-id", str(cid),
@@ -247,39 +257,39 @@ def test_real_multiprocess_run_on_real_data_separates_honest_and_attacker_trust(
     round_history = history["round_history"]
     assert len(round_history) == NUM_ROUNDS
 
-    attacker_key = str(ATTACKER_CLIENT_ID)
-    excluded_rounds = sum(1 for entry in round_history if entry["is_outlier"].get(attacker_key, False))
-    print(f"Real-data: attacker excluded in {excluded_rounds}/{NUM_ROUNDS} rounds")
-    assert excluded_rounds >= (NUM_ROUNDS * 0.6), (
-        f"Attacker should be excluded from aggregation in most rounds on real data, "
-        f"got {excluded_rounds}/{NUM_ROUNDS}. Round history: {round_history}"
-    )
-
     print("Per-round trust scores:")
     for entry in round_history:
         print(f"  round {entry['round']}: {entry['trust_scores']}")
 
-    attacker_trajectory = [entry["trust_scores"][attacker_key] for entry in round_history]
+    half = NUM_ROUNDS // 2
     honest_trajectories = {
         cid: [entry["trust_scores"][str(cid)] for entry in round_history] for cid in range(NUM_HONEST_CLIENTS)
     }
-    print(f"Attacker trust trajectory: {attacker_trajectory}")
-
-    half = NUM_ROUNDS // 2
-    attacker_late_avg = sum(attacker_trajectory[half:]) / len(attacker_trajectory[half:])
     honest_late_avgs = {cid: sum(traj[half:]) / len(traj[half:]) for cid, traj in honest_trajectories.items()}
-
     assert all(avg > 0.55 for avg in honest_late_avgs.values()), (
         f"Honest clients' trust should stay high on real data, got late-round averages={honest_late_avgs}"
     )
-    assert min(honest_late_avgs.values()) - attacker_late_avg > 0.08, (
-        f"Expected a clear separation between honest and attacker trust on real data, "
-        f"got honest={honest_late_avgs}, attacker={attacker_late_avg}"
-    )
 
-    attacker_early_avg = sum(attacker_trajectory[:half]) / len(attacker_trajectory[:half])
-    assert attacker_late_avg < attacker_early_avg * 0.9, (
-        f"Attacker's trust should visibly decay over rounds on real data, "
-        f"got early_avg={attacker_early_avg:.3f} late_avg={attacker_late_avg:.3f} "
-        f"trajectory={attacker_trajectory}"
-    )
+    for attacker_id in ATTACKER_CLIENT_IDS:
+        attacker_key = str(attacker_id)
+        excluded_rounds = sum(1 for entry in round_history if entry["is_outlier"].get(attacker_key, False))
+        print(f"Real-data: attacker {attacker_id} excluded in {excluded_rounds}/{NUM_ROUNDS} rounds")
+        assert excluded_rounds >= (NUM_ROUNDS * 0.6), (
+            f"Attacker {attacker_id} should be excluded from aggregation in most rounds on real data, "
+            f"got {excluded_rounds}/{NUM_ROUNDS}. Round history: {round_history}"
+        )
+
+        attacker_trajectory = [entry["trust_scores"][attacker_key] for entry in round_history]
+        print(f"Attacker {attacker_id} trust trajectory: {attacker_trajectory}")
+        attacker_late_avg = sum(attacker_trajectory[half:]) / len(attacker_trajectory[half:])
+        assert min(honest_late_avgs.values()) - attacker_late_avg > 0.08, (
+            f"Expected a clear separation between honest and attacker {attacker_id} trust on real data, "
+            f"got honest={honest_late_avgs}, attacker={attacker_late_avg}"
+        )
+
+        attacker_early_avg = sum(attacker_trajectory[:half]) / len(attacker_trajectory[:half])
+        assert attacker_late_avg < attacker_early_avg * 0.9, (
+            f"Attacker {attacker_id}'s trust should visibly decay over rounds on real data, "
+            f"got early_avg={attacker_early_avg:.3f} late_avg={attacker_late_avg:.3f} "
+            f"trajectory={attacker_trajectory}"
+        )

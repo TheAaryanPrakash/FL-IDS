@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 
+import torch
 from flwr.common import NDArrays, Parameters, Scalar, ndarrays_to_parameters
 from flwr.server import ServerConfig, start_server
 from flwr.server.history import History
@@ -58,7 +59,14 @@ def make_fit_config_fn(boosting_model_bytes: bytes, num_classes: int, benign_cla
 
 
 def build_initial_parameters(config: Config, input_dim: int) -> Parameters:
-    """Build initial global autoencoder weights, so every client starts identically."""
+    """Build initial global autoencoder weights, so every client starts identically.
+
+    Seeded from `config.seed`: torch's default generator is *not* a fixed
+    constant across processes, so an unseeded init made every real FL run
+    start from different weights -- and every trust score downstream of it
+    irreproducible.
+    """
+    torch.manual_seed(config.seed)
     init_model = Autoencoder(input_dim, config.autoencoder.hidden_dims, config.autoencoder.bottleneck_dim)
     weights: NDArrays = get_weights(init_model)
     return ndarrays_to_parameters(weights)
