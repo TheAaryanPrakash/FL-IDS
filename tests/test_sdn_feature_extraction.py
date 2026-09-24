@@ -43,29 +43,27 @@ def test_clean_and_encode_live_converts_hex_and_numeric_fields():
     assert "http.request.method_POST" in encoded.columns
 
 
-def test_clean_and_encode_live_marks_missing_categoricals_with_sentinel():
-    raw_df = pd.DataFrame({"mqtt.protoname": ["MQTT", None, ""]})
+def test_clean_and_encode_live_maps_missing_categoricals_to_canonical_placeholder():
+    # tshark reports a field that doesn't apply as empty; literal placeholder
+    # spellings must land on the same canonical column training uses.
+    raw_df = pd.DataFrame({"mqtt.protoname": ["MQTT", None, "", "0.0", "0"]})
     encoded = clean_and_encode_live(raw_df)
 
-    # Two of three rows are placeholder (missing/empty) -> sentinel column.
-    sentinel_cols = [c for c in encoded.columns if "PLACEHOLDER" in c]
-    assert len(sentinel_cols) == 1
-    assert encoded[sentinel_cols[0]].sum() == 2
+    assert encoded["mqtt.protoname_0"].sum() == 4
     assert encoded["mqtt.protoname_MQTT"].sum() == 1
+    assert "mqtt.protoname_0.0" not in encoded.columns
 
 
-def test_align_to_feature_schema_resolves_placeholder_to_both_known_variants():
-    raw_df = pd.DataFrame({"mqtt.protoname": [None, None]})
+def test_align_to_feature_schema_uses_the_single_trained_placeholder_column():
+    raw_df = pd.DataFrame({"mqtt.protoname": [None, "MQTT"]})
     encoded = clean_and_encode_live(raw_df)
 
-    # Trained schema has both "_0" and "_0.0" variants for this field.
-    feature_names = ["mqtt.protoname_0", "mqtt.protoname_0.0", "mqtt.protoname_MQTT"]
+    # The trained schema has one placeholder column per field (see
+    # fl_ids.data.pipeline.canonicalize_placeholders).
+    feature_names = ["mqtt.protoname_0", "mqtt.protoname_MQTT"]
     aligned = align_to_feature_schema(encoded, feature_names)
 
-    assert aligned.shape == (2, 3)
-    assert np.array_equal(aligned[:, 0], [1.0, 1.0])  # _0 activated
-    assert np.array_equal(aligned[:, 1], [1.0, 1.0])  # _0.0 also activated
-    assert np.array_equal(aligned[:, 2], [0.0, 0.0])  # MQTT not activated
+    assert np.array_equal(aligned, [[1.0, 0.0], [0.0, 1.0]])
 
 
 def test_align_to_feature_schema_drops_unseen_columns_and_fills_missing():

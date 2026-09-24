@@ -18,6 +18,16 @@ redone. `Attack_label` is additionally excluded from the feature matrix
 (beyond the authors' recipe) because it is fully derivable from the
 `Attack_type` target used here (0 iff Attack_type == "Normal"), so keeping
 it as a feature would leak the label.
+
+One deliberate departure from the authors' recipe: the "field doesn't
+apply" placeholder in the categorical columns is spelled "0" in some
+source capture files and "0.0" in others, and the spelling follows the
+label -- in the mqtt.* and dns.qry.name.len columns every Normal row says
+"0" and every attack row "0.0", so the one-hot column `mqtt.topic_0.0`
+alone separates benign from attack with AUROC 1.0. That's an export
+artifact, not network behavior, and any model trained on it learns the
+file format. `canonicalize_placeholders` collapses both spellings to one
+before encoding (see its docstring).
 """
 
 from __future__ import annotations
@@ -65,6 +75,11 @@ CATEGORICAL_COLUMNS: list[str] = [
     "mqtt.protoname",
     "mqtt.topic",
 ]
+
+# Spellings of the categorical columns' "field doesn't apply" placeholder,
+# and the one they're all rewritten to. Only these two occur in the dataset.
+PLACEHOLDER_SPELLINGS: tuple[str, ...] = ("0", "0.0")
+CANONICAL_PLACEHOLDER = "0"
 
 TARGET_COLUMN = "Attack_type"
 LEAKY_LABEL_COLUMNS: list[str] = ["Attack_label"]
@@ -123,6 +138,49 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         after_na - after_dup,
     )
     return df.reset_index(drop=True)
+
+
+def canonicalize_placeholders(
+    df: pd.DataFrame, categorical_columns: list[str] | None = None
+) -> pd.DataFrame:
+    """Rewrite every placeholder spelling in the categorical columns to one canonical value.
+
+    The authors' CSV writes the "field doesn't apply" placeholder as "0" or
+    "0.0" depending on which per-attack/per-device capture file a row came
+    from, so the spelling encodes the label: in mqtt.topic,
+    mqtt.conack.flags, mqtt.protoname and dns.qry.name.len every Normal row
+    uses "0" and every attack row "0.0" (no overlap across 2.2M rows).
+    Left alone, one-hot encoding turns that into a perfect benign-vs-attack
+    feature. Live traffic has no such spelling (tshark reports an absent
+    field as empty), so a model leaning on it would also fail in Phase B.
+
+    Must run before `clean_dataframe`, so rows that differed only in
+    placeholder spelling are deduplicated together.
+
+    Args:
+        df: Raw (post-column-drop) DataFrame.
+        categorical_columns: Columns to canonicalize; defaults to
+            `CATEGORICAL_COLUMNS`.
+
+    Returns:
+        A copy of `df` with every `PLACEHOLDER_SPELLINGS` value in those
+        columns replaced by `CANONICAL_PLACEHOLDER`.
+    """
+    categorical_columns = (
+        categorical_columns if categorical_columns is not None else CATEGORICAL_COLUMNS
+    )
+    df = df.copy()
+    for col in categorical_columns:
+        if col not in df.columns:
+            continue
+        as_str = df[col].astype(str)
+        is_placeholder = as_str.isin(PLACEHOLDER_SPELLINGS)
+        # Only rows that actually hold a value get rewritten; NaN stays NaN
+        # for clean_dataframe to drop.
+        is_placeholder &= df[col].notna()
+        df[col] = df[col].astype(object).where(~is_placeholder, CANONICAL_PLACEHOLDER)
+        logger.debug("Canonicalized %d placeholder values in %s", int(is_placeholder.sum()), col)
+    return df
 
 
 def one_hot_encode_categoricals(
@@ -322,6 +380,7 @@ def load_and_encode(csv_path: str | Path) -> tuple[np.ndarray, np.ndarray, Label
             (would indicate a bug in `clean_dataframe`).
     """
     df = load_raw_csv(csv_path)
+    df = canonicalize_placeholders(df)
     df = clean_dataframe(df)
     df = one_hot_encode_categoricals(df)
 

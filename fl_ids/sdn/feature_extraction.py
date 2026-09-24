@@ -29,7 +29,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from fl_ids.data.pipeline import CATEGORICAL_COLUMNS, DEFAULT_DROP_COLUMNS
+from fl_ids.data.pipeline import (
+    CANONICAL_PLACEHOLDER,
+    CATEGORICAL_COLUMNS,
+    DEFAULT_DROP_COLUMNS,
+    PLACEHOLDER_SPELLINGS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,26 +128,11 @@ def _to_numeric(series: pd.Series) -> pd.Series:
     return series.map(convert)
 
 
-# The real DNN-EdgeIIoT-dataset.csv was assembled by concatenating
-# separately-exported per-device/per-attack CSVs (see data/raw/Readme.txt's
-# directory listing), and those source files didn't agree on how to
-# represent "this field doesn't apply to this packet" -- some literally
-# wrote "0", others "0.0". Both survive as separate one-hot columns in
-# the trained schema (e.g. `mqtt.protoname_0` AND `mqtt.protoname_0.0`).
-# Which convention dominates isn't a fixed global rule either: it
-# correlates with *which attack type or device* a row came from (e.g.
-# DDoS_ICMP rows are ~100% "_0.0" while the overall dataset is ~70% "_0",
-# dominated by MQTT-heavy Normal traffic) -- discovered by comparing
-# live-extracted feature means against per-class training means. Live
-# inference can't know the true attack type in advance (that's what's
-# being predicted), so there's no single placeholder string that's
-# correct to emit. Instead, a placeholder value activates *both* known
-# variant columns (whichever exist in the trained schema) -- accurate
-# "this field doesn't apply" information without falsely committing to
-# one literal-string convention the model may have learned to key off
-# depending on training data provenance.
-_PLACEHOLDER_SENTINEL = "__FL_IDS_PLACEHOLDER__"
-_PLACEHOLDER_VARIANTS = ("0", "0.0")
+# A field that doesn't apply to a packet comes out of tshark empty. The
+# training pipeline writes that case as `CANONICAL_PLACEHOLDER` for every
+# row (fl_ids.data.pipeline.canonicalize_placeholders collapses the source
+# CSVs' label-correlated "0"/"0.0" spellings), so live traffic maps empty
+# fields, and any literal placeholder spelling, to that same value.
 
 
 def clean_and_encode_live(raw_df: pd.DataFrame) -> pd.DataFrame:
@@ -154,16 +144,16 @@ def clean_and_encode_live(raw_df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         A DataFrame with numeric fields converted and the same nominal
         columns one-hot encoded as component 1's training pipeline
-        (`fl_ids.data.pipeline.one_hot_encode_categoricals`), with
-        "field doesn't apply" placeholders marked with a sentinel column
-        (`<field>_{_PLACEHOLDER_SENTINEL}`) rather than committing to one
-        of the "0"/"0.0" conventions the training data used inconsistently
-        — resolved against the trained schema in `align_to_feature_schema`.
+        (`fl_ids.data.pipeline.one_hot_encode_categoricals`), with empty
+        or placeholder categorical values written as the training
+        pipeline's `CANONICAL_PLACEHOLDER`.
     """
     df = raw_df.copy()
     for col in df.columns:
         if col in CATEGORICAL_COLUMNS:
-            df[col] = df[col].fillna(_PLACEHOLDER_SENTINEL).replace("", _PLACEHOLDER_SENTINEL)
+            values = df[col].fillna("").astype(str)
+            is_placeholder = (values == "") | values.isin(PLACEHOLDER_SPELLINGS)
+            df[col] = values.where(~is_placeholder, CANONICAL_PLACEHOLDER)
         else:
             df[col] = _to_numeric(df[col])
 
@@ -179,10 +169,7 @@ def align_to_feature_schema(df: pd.DataFrame, feature_names: list[str]) -> np.nd
     requests in this batch) — those columns are filled with 0, matching
     "this category wasn't observed." Any column produced live but absent
     from the trained schema (an unseen category value) is dropped, since
-    the model has no corresponding weight for it. Placeholder-sentinel
-    columns (see `clean_and_encode_live`) are resolved by activating
-    every "0"/"0.0"-variant column the trained schema actually has for
-    that field.
+    the model has no corresponding weight for it.
 
     Args:
         df: Output of `clean_and_encode_live`.
@@ -193,17 +180,6 @@ def align_to_feature_schema(df: pd.DataFrame, feature_names: list[str]) -> np.nd
         A float32 array, shape (n_packets, len(feature_names)), column
         order matching `feature_names` exactly.
     """
-    df = df.copy()
-    for col in CATEGORICAL_COLUMNS:
-        sentinel_col = f"{col}_{_PLACEHOLDER_SENTINEL}"
-        if sentinel_col not in df.columns:
-            continue
-        for variant in _PLACEHOLDER_VARIANTS:
-            variant_col = f"{col}_{variant}"
-            if variant_col in feature_names:
-                df[variant_col] = df.get(variant_col, 0) + df[sentinel_col]
-        df = df.drop(columns=[sentinel_col])
-
     aligned = df.reindex(columns=feature_names, fill_value=0.0)
     return aligned.to_numpy(dtype=np.float32)
 

@@ -18,6 +18,8 @@ import pandas as pd
 import pytest
 
 from fl_ids.data.pipeline import (
+    canonicalize_placeholders,
+    load_and_encode,
     CATEGORICAL_COLUMNS,
     DEFAULT_DROP_COLUMNS,
     TARGET_COLUMN,
@@ -139,6 +141,20 @@ def test_one_hot_encode_categoricals_replaces_columns_with_indicators():
     assert "http.request.method_GET" in encoded.columns
     assert "http.request.method_POST" in encoded.columns
     assert "numeric_col" in encoded.columns
+
+
+def test_canonicalize_placeholders_collapses_spellings_before_encoding():
+    df = pd.DataFrame(
+        {
+            "mqtt.topic": ["0", "0.0", "Temperature_and_Humidity", None],
+            "tcp.len": [0.0, 1.0, 2.0, 3.0],
+        }
+    )
+    encoded = one_hot_encode_categoricals(canonicalize_placeholders(df))
+
+    assert "mqtt.topic_0.0" not in encoded.columns
+    assert encoded["mqtt.topic_0"].tolist() == [1, 1, 0, 0]
+    assert encoded["tcp.len"].tolist() == [0.0, 1.0, 2.0, 3.0]  # non-categorical columns untouched
 
 
 def test_dirichlet_partition_is_a_complete_nonoverlapping_split():
@@ -328,3 +344,34 @@ def test_build_server_and_federated_dataset_calibration_disjoint_from_clients():
     assert total_client_rows == expected_X_pool.shape[0]
     # Calibration set (~5%) should be much smaller than what's left for clients.
     assert X_calib.shape[0] < total_client_rows * 0.1
+
+
+@pytest.mark.skipif(not REAL_DATASET_PATH.exists(), reason="real dataset not present")
+def test_no_single_feature_separates_benign_from_attack_on_real_data():
+    """Guards against export artifacts leaking the label into the features.
+
+    The source CSVs spell the categorical placeholder "0" for Normal rows
+    and "0.0" for attack rows in several columns; before canonicalization
+    the one-hot column `mqtt.topic_0.0` alone scored AUROC 1.0000. After
+    it, the strongest single feature (tcp.flags.ack) scores ~0.71. Real
+    traffic features overlap; a near-perfect single feature means a
+    recording artifact, not behavior.
+    """
+    from sklearn.metrics import roc_auc_score
+    from sklearn.model_selection import train_test_split
+
+    X, y, _, feature_names, benign_class = load_and_encode(REAL_DATASET_PATH)
+    assert not [f for f in feature_names if f.endswith("_0.0")]
+
+    X_sample, _, y_sample, _ = train_test_split(X, y, train_size=100_000, random_state=0, stratify=y)
+    is_attack = (y_sample != benign_class).astype(int)
+    too_separable = {}
+    for j, name in enumerate(feature_names):
+        column = X_sample[:, j]
+        if column.std() == 0:
+            continue
+        auroc = roc_auc_score(is_attack, column)
+        auroc = max(auroc, 1.0 - auroc)
+        if auroc > 0.9:
+            too_separable[name] = round(auroc, 4)
+    assert not too_separable, f"features that alone separate benign from attack: {too_separable}"
