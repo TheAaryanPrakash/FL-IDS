@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
@@ -69,6 +70,7 @@ FEATURE_FIELDS: list[str] = [f for f in ALL_WIRESHARK_FIELDS if f not in DEFAULT
 
 _HEX_LIKE_PREFIX = "0x"
 _BOOLEAN_VALUES = {"True": 1.0, "False": 0.0}
+_HEX_VALUE = re.compile(r"0x[0-9a-fA-F]+")
 
 
 def _stage_in_tmp(pcap_path: str | Path) -> Path:
@@ -152,6 +154,19 @@ def _to_numeric(series: pd.Series) -> pd.Series:
 # fields, and any literal placeholder spelling, to that same value.
 
 
+def _authors_hex_spelling(value: str) -> str:
+    """Rewrite a hex categorical value in the dataset authors' 8-digit spelling.
+
+    One-hot categories are matched by exact string, and tshark 4.x prints
+    e.g. `mqtt.conack.flags` as `0x00` where the authors' version wrote
+    `0x00000000` -- same value, but a category the trained model has never
+    seen, so live MQTT CONNACK packets lost the feature entirely.
+    """
+    if _HEX_VALUE.fullmatch(value):
+        return f"0x{int(value, 16):08x}"
+    return value
+
+
 def clean_and_encode_live(raw_df: pd.DataFrame) -> pd.DataFrame:
     """Clean and one-hot encode freshly-extracted live fields.
 
@@ -168,7 +183,7 @@ def clean_and_encode_live(raw_df: pd.DataFrame) -> pd.DataFrame:
     df = raw_df.copy()
     for col in df.columns:
         if col in CATEGORICAL_COLUMNS:
-            values = df[col].fillna("").astype(str)
+            values = df[col].fillna("").astype(str).map(_authors_hex_spelling)
             is_placeholder = (values == "") | values.isin(PLACEHOLDER_SPELLINGS)
             df[col] = values.where(~is_placeholder, CANONICAL_PLACEHOLDER)
         else:

@@ -57,6 +57,13 @@ def test_tshark_4_boolean_fields_become_ones_and_zeros(caplog):
     assert "tcp.len: 1 values couldn't be parsed" in caplog.text
 
 
+def test_hex_categoricals_use_the_dataset_authors_spelling():
+    # tshark 4.x: "0x00"; the authors' tshark (and so the training schema): "0x00000000".
+    encoded = clean_and_encode_live(pd.DataFrame({"mqtt.conack.flags": ["0x00", "0x00000000", ""]}))
+    assert encoded["mqtt.conack.flags_0x00000000"].tolist() == [1, 1, 0]
+    assert "mqtt.conack.flags_0x00" not in encoded.columns
+
+
 def test_clean_and_encode_live_maps_missing_categoricals_to_canonical_placeholder():
     # tshark reports a field that doesn't apply as empty; literal placeholder
     # spellings must land on the same canonical column training uses.
