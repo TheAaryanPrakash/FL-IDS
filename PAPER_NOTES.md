@@ -15,7 +15,8 @@
 
 Last updated: 2026-09-25. Phase 6 regeneration at commit `7d127a0`: ablation
 complete; poisoning sweep and standalone zero-day killed for low memory
-(§8.3), to be rerun sequentially.
+(§8.3), to be rerun sequentially. Real multi-process Phase A OOMs on the
+old VM; work moves to a new PC (§12.1).
 
 ---
 
@@ -826,3 +827,55 @@ rounds, seed 42):
 - Real-data Phase A to completion → bundle → Phase B with a real pcap →
   mitigation latency.
 - Phase 9 end-to-end recorded run.
+
+### 12.1 Handoff: real multi-process Phase A doesn't fit this VM (2026-09-25)
+Work moves to a new PC. Everything here is from the kernel log and
+measurements on the old VM (7.2 GB RAM, 4 GB swap, 4 vCPUs), commit `41d958b`.
+
+- **Every real Phase A attempt was killed by the kernel OOM killer**, not a
+  Python error (logs just stop, no traceback): 2026-09-25 06:57, 07:18,
+  07:22. The 07:22 victim was the **server** (anon RSS 1.50 GB); free swap
+  was 120 kB. `41d958b`'s premise (the orchestrator was the problem) was
+  only partly right.
+- Per-process footprint at the 07:22 kill (RSS + swap, kernel dump):
+  server ~1.54 GB; orchestrator ~0.94 GB (mostly swapped, idle during
+  training, even after `41d958b`'s `del X, y`); each of the 10 clients
+  ~0.56 GB, ~5.6 GB total. The clients are the bulk.
+- A client's baseline before any work: ~430 MB (torch import ~210 MB,
+  lightgbm import ~140 MB, parsed 300-tree boosting model ~35 MB).
+- Probe: server + 2 real clients, 8 rounds, the saved `runs/phase_a` files:
+  - Boosting update disabled: server flat at ~630 MB from round 2.
+  - Update enabled (every 3 rounds): server 486 → 870 MB by round 8
+    (+~150 MB at the round-3 update). Clients 700–810 MB each, also
+    growing after update rounds.
+  - `MALLOC_ARENA_MAX=2 OMP_NUM_THREADS=1`: server −~150 MB, clients
+    −~50 MB. Not a fix.
+- Likely causes, not yet fixed or verified:
+  1. The ~11 MB boosting model goes into every client's fit config every
+     round (`broadcast_every_n_rounds: 1`). Send it only when its version
+     changes; clients keep the last copy. Also fixes §8.6 / limitation 13.
+  2. `lgb.train` keeps its training `Dataset` (calibration + all alerts)
+     referenced from each new booster on the server. Free it after training.
+  3. The orchestrator keeps ~0.9 GB after data prep. Run prep in a
+     short-lived subprocess.
+- Shrinking the dataset doesn't help. The federated pool is already
+  60k rows. A proportional 40k-row sample would leave ~18 Fingerprinting
+  and ~22 MITM rows (counts from the raw CSV: 1,001 and 1,214), so ~1 of
+  each in the 5% calibration set.
+- Client count for a reduced demo run: trimmed mean trims
+  `floor(0.15 × survivors)` per side (`fl_ids/robustness/aggregation.py`),
+  i.e. nothing below 7 survivors. 5 clients (1 sign-flip attacker) shows
+  all five pillars but leaves the trimmed mean inert. ~8 clients is the
+  smallest count where it trims. Such a run is a demo, not citable.
+- On the new PC: `git clone`; copy `archive.zip` (or re-download from
+  Kaggle) into `data/raw/` with the same layout; copy
+  `data/processed/MITM_reextracted.csv` or regenerate it (command in
+  `configs/config.yaml`); recreate the venv from `requirements.txt`. The
+  ablation CSVs and the ablation / poisoning-sweep logs are committed
+  under `results/` (force-added past `.gitignore`), since they took
+  ~8 hours to produce and §8.2–8.3 cite them.
+- Order of remaining work: the fixes above → rerun the poisoning sweep
+  and standalone zero-day **one at a time** (running both together caused
+  the 04:48 kill) → multi-seed repeats → real 10-client Phase A → Phase B
+  on its bundle (re-check the Backdoor→DDoS_HTTP misclassification, §8.7)
+  → Phase 9 → Phase 10.
