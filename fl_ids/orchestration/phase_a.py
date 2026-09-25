@@ -360,6 +360,10 @@ def run_phase_a(
 
     X, y, label_encoder, feature_names, benign_class = load_and_encode(csv_path, config.data.capture_repairs)
     prepared = prepare_data(X, y, list(label_encoder.classes_), benign_class, feature_names, config)
+    # Everything later uses `prepared`. The full matrix (1.9M x 91 float64,
+    # ~1.4 GB) held through training pushed the 11-process run into swap on
+    # a 7 GB machine, so let it go before the server and clients start.
+    del X, y
 
     malicious = select_malicious_clients(
         list(prepared.client_data), config.orchestration.malicious_fraction, config.seed
