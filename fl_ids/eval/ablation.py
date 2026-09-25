@@ -31,6 +31,7 @@ import pandas as pd
 
 from fl_ids.eval.common import EvaluationSetup, select_malicious_clients
 from fl_ids.eval.variants import ABLATION_VARIANTS, score_on_test_set, train_variant
+from fl_ids.eval.checkpoint import RowCheckpoint, run_fingerprint
 from fl_ids.eval.zero_day import zero_day_detection_by_run
 from fl_ids.utils.config import Config
 
@@ -102,6 +103,7 @@ def add_zero_day_column(
     num_rounds: int,
     poisoning_fraction: float,
     seed: int,
+    checkpoint: RowCheckpoint | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Fill `zero_day_macro_recall` by retraining every variant once per held-out attack class.
 
@@ -112,12 +114,15 @@ def add_zero_day_column(
         num_rounds: FL rounds per training.
         poisoning_fraction: Same fraction as the main table.
         seed: Same seed as the main table.
+        checkpoint: Passed to `zero_day_detection_by_run`.
 
     Returns:
         (table with the column filled, per-(variant, holdout class) detection rates).
     """
     runs = [(v.name, v, poisoning_fraction) for v in ABLATION_VARIANTS]
-    detail = zero_day_detection_by_run(runs, X, y, class_names, benign_class, config, num_rounds, seed)
+    detail = zero_day_detection_by_run(
+        runs, X, y, class_names, benign_class, config, num_rounds, seed, checkpoint=checkpoint
+    )
     means = detail.groupby("run")["detection_rate"].mean()
     table = table.copy()
     table["zero_day_macro_recall"] = table["variant"].map(means)
@@ -158,15 +163,24 @@ if __name__ == "__main__":
     )
     per_class_df.to_csv(output_dir / "ablation_per_class_recall.csv", index=False)
 
+    checkpoint = None
     if not args.skip_zero_day:
+        checkpoint = RowCheckpoint(
+            output_dir / "ablation_zero_day.checkpoint.csv",
+            run_fingerprint(run_config, args.num_rounds, args.seed, poisoning_fraction=args.poisoning_fraction),
+            ("run", "holdout_class"),
+        )
         ablation_df, zero_day_df = add_zero_day_column(
             ablation_df, X_all, y_all, names, benign, run_config,
             num_rounds=args.num_rounds, poisoning_fraction=args.poisoning_fraction, seed=args.seed,
+            checkpoint=checkpoint,
         )
         zero_day_df.to_csv(output_dir / "ablation_zero_day_detail.csv", index=False)
 
     csv_path = output_dir / "ablation_table.csv"
     ablation_df.to_csv(csv_path, index=False)
     logger.info("Saved %s", csv_path)
+    if checkpoint:
+        checkpoint.remove()
 
     print(ablation_df.to_string(index=False))

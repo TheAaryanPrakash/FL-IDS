@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
+from fl_ids.eval.checkpoint import RowCheckpoint
 from fl_ids.eval.common import (
     EvaluationSetup,
     assign_rows_to_clients,
@@ -183,6 +184,7 @@ def run_zero_day_experiment(
     num_rounds: int,
     seed: int,
     pool_subsample_size: int = 60_000,
+    checkpoint: RowCheckpoint | None = None,
 ) -> pd.DataFrame:
     """Run the leave-one-attack-class-out experiment over every configured holdout class.
 
@@ -199,6 +201,7 @@ def run_zero_day_experiment(
         num_rounds: FL rounds per holdout run.
         seed: Random seed (splits, partitioning, model init, row sampling).
         pool_subsample_size: Caps the federated-client pool size.
+        checkpoint: Keyed on `holdout_class`; finished classes are reused.
 
     Returns:
         One row per held-out class (see `evaluate_zero_day_holdout`).
@@ -206,6 +209,9 @@ def run_zero_day_experiment(
     rows = []
     for holdout_class in resolve_holdout_classes(config.evaluation.zero_day_holdout_classes, class_names, benign_class):
         name = class_names[holdout_class]
+        if checkpoint and (finished := checkpoint.get(name)):
+            rows.append(finished)
+            continue
         logger.info("Zero-day run: holding out %s", name)
         setup = build_evaluation_setup_from_arrays(
             X, y, class_names, benign_class, config, seed, pool_subsample_size,
@@ -216,6 +222,8 @@ def run_zero_day_experiment(
         row = evaluate_zero_day_holdout(setup, trained, X[holdout_idx], config, seed)
         row["final_val_loss"] = trained.simulation.rounds[-1].mean_val_loss
         rows.append(row)
+        if checkpoint:
+            checkpoint.append(row)
         logger.info(
             "holdout=%s: boosting_only=%.3f autoencoder_alone=%.3f cascade=%.3f (benign FPR %.4f -> %.4f)",
             name, row["boosting_only_detection_rate"], row["autoencoder_alone_detection_rate"],
@@ -234,6 +242,7 @@ def zero_day_detection_by_run(
     num_rounds: int,
     seed: int,
     pool_subsample_size: int = 60_000,
+    checkpoint: RowCheckpoint | None = None,
 ) -> pd.DataFrame:
     """Held-out-attack detection rate for several pipeline variants, one row per (run, holdout class).
 
@@ -251,6 +260,9 @@ def zero_day_detection_by_run(
         num_rounds: FL rounds per training.
         seed: Random seed.
         pool_subsample_size: Caps the federated-client pool size.
+        checkpoint: Keyed on (`run`, `holdout_class`). Finished rows are
+            reused, and a holdout class whose runs are all finished skips
+            building its setup.
 
     Returns:
         Columns `run`, `holdout_class`, `detection_rate`.
@@ -258,6 +270,10 @@ def zero_day_detection_by_run(
     rows = []
     for holdout_class in resolve_holdout_classes(config.evaluation.zero_day_holdout_classes, class_names, benign_class):
         name = class_names[holdout_class]
+        done = {label: checkpoint.get(label, name) for label, _v, _f in runs} if checkpoint else {}
+        if done and all(done.values()):
+            rows.extend(done[label] for label, _v, _f in runs)
+            continue
         setup = build_evaluation_setup_from_arrays(
             X, y, class_names, benign_class, config, seed, pool_subsample_size,
             excluded_classes=frozenset({holdout_class}),
@@ -267,10 +283,16 @@ def zero_day_detection_by_run(
         X_holdout_norm, holdout_clients = assign_rows_to_clients(setup, X_holdout_raw, seed)
         client_ids = list(setup.client_data)
         for label, variant, fraction in runs:
+            if done.get(label):
+                rows.append(done[label])
+                continue
             malicious = select_malicious_clients(client_ids, fraction, seed)
             trained = train_variant(variant, setup, config, num_rounds, malicious, seed)
             rate = float(flag_rows(trained, setup, X_holdout_raw, X_holdout_norm, holdout_clients, config).mean())
-            rows.append({"run": label, "holdout_class": name, "detection_rate": rate})
+            row = {"run": label, "holdout_class": name, "detection_rate": rate}
+            rows.append(row)
+            if checkpoint:
+                checkpoint.append(row)
             logger.info("zero-day holdout=%s run=%s: detection_rate=%.3f", name, label, rate)
     return pd.DataFrame(rows)
 
@@ -368,10 +390,16 @@ if __name__ == "__main__":
     output_dir = Path(args.output_dir or run_config.evaluation.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    from fl_ids.eval.checkpoint import run_fingerprint
+
+    checkpoint = RowCheckpoint(
+        output_dir / "zero_day_holdout.checkpoint.csv",
+        run_fingerprint(run_config, args.num_rounds, args.seed), ("holdout_class",),
+    )
     X_all, y_all, label_encoder, _feature_names, benign = load_and_encode(args.real_csv_path, run_config.data.capture_repairs)
     results_df = run_zero_day_experiment(
         X_all, y_all, list(label_encoder.classes_), benign, run_config,
-        num_rounds=args.num_rounds, seed=args.seed,
+        num_rounds=args.num_rounds, seed=args.seed, checkpoint=checkpoint,
     )
 
     csv_path = output_dir / "zero_day_holdout.csv"
@@ -381,5 +409,6 @@ if __name__ == "__main__":
     plot_path = output_dir / "zero_day_holdout.png"
     plot_zero_day(results_df, plot_path)
     logger.info("Saved %s", plot_path)
+    checkpoint.remove()
 
     print(results_df.to_string(index=False))

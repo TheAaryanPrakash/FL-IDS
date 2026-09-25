@@ -25,6 +25,7 @@ import pandas as pd
 
 from fl_ids.eval.common import EvaluationSetup, select_malicious_clients
 from fl_ids.eval.variants import FULL_PIPELINE, malicious_survival_rate, score_on_test_set, train_variant
+from fl_ids.eval.checkpoint import RowCheckpoint, run_fingerprint
 from fl_ids.eval.zero_day import zero_day_detection_by_run
 from fl_ids.utils.config import Config
 
@@ -107,6 +108,7 @@ def add_zero_day_column(
     config: Config,
     num_rounds: int,
     seed: int,
+    checkpoint: RowCheckpoint | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Fill `zero_day_macro_recall` by retraining at every fraction once per held-out attack class.
 
@@ -116,13 +118,16 @@ def add_zero_day_column(
         config: Full project config (`evaluation.zero_day_*`, poisoning fractions).
         num_rounds: FL rounds per training.
         seed: Same seed as the sweep.
+        checkpoint: Passed to `zero_day_detection_by_run`.
 
     Returns:
         (sweep with the column filled, per-(fraction, holdout class) detection rates).
     """
     fractions = list(sweep["malicious_fraction"])
     runs = [(_run_label(f), FULL_PIPELINE, f) for f in fractions]
-    detail = zero_day_detection_by_run(runs, X, y, class_names, benign_class, config, num_rounds, seed)
+    detail = zero_day_detection_by_run(
+        runs, X, y, class_names, benign_class, config, num_rounds, seed, checkpoint=checkpoint
+    )
     means = detail.groupby("run")["detection_rate"].mean()
     sweep = sweep.copy()
     sweep["zero_day_macro_recall"] = [means[_run_label(f)] for f in fractions]
@@ -221,9 +226,15 @@ if __name__ == "__main__":
     eval_setup = build_evaluation_setup_from_arrays(X_all, y_all, names, benign, run_config, args.seed)
     sweep_df = run_poisoning_sweep(eval_setup, run_config, num_rounds=args.num_rounds, seed=args.seed)
 
+    checkpoint = None
     if not args.skip_zero_day:
+        checkpoint = RowCheckpoint(
+            output_dir / "poisoning_zero_day.checkpoint.csv",
+            run_fingerprint(run_config, args.num_rounds, args.seed), ("run", "holdout_class"),
+        )
         sweep_df, zero_day_df = add_zero_day_column(
-            sweep_df, X_all, y_all, names, benign, run_config, num_rounds=args.num_rounds, seed=args.seed
+            sweep_df, X_all, y_all, names, benign, run_config, num_rounds=args.num_rounds, seed=args.seed,
+            checkpoint=checkpoint,
         )
         zero_day_df.to_csv(output_dir / "poisoning_zero_day_detail.csv", index=False)
 
@@ -234,5 +245,7 @@ if __name__ == "__main__":
     plot_path = output_dir / "poisoning_resistance_sweep.png"
     plot_poisoning_sweep(sweep_df, plot_path)
     logger.info("Saved %s", plot_path)
+    if checkpoint:
+        checkpoint.remove()
 
     print(sweep_df.to_string(index=False))
